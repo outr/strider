@@ -37,8 +37,8 @@ ThisBuild / scmInfo := Some(
 )
 
 // Dependency versions
-val spiceVersion = "1.6.0"
-val lightdbVersion = "4.31.0-SNAPSHOT"
+val spiceVersion = "1.7.0"
+val lightdbVersion = "4.31.0"
 val rapidVersion = "2.9.2"
 val scalatestVersion = "3.2.20"
 

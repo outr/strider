@@ -938,7 +938,7 @@ object db extends LightDB {
   override type SM = SplitStoreManager[RocksDBStore.type, LuceneStore.type]
   override val storeManager: SM = SplitStoreManager(RocksDBStore, LuceneStore)
 
-  val workflows: Collection[Workflow, WorkflowModel.type] = store[Workflow, WorkflowModel.type](WorkflowModel)
+  val workflows: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel)()
 
   override def directory: Option[Path] = Some(Path.of("db", "workflows"))
   override def upgrades: List[DatabaseUpgrade] = Nil
