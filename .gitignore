@@ -1,0 +1,15 @@
+target/
+project/target/
+project/project/
+.bsp/
+.bloop/
+.metals/
+.idea/
+.vscode/
+*.iml
+.sbt/
+.ivy2/
+.cache/
+*.log
+db/
+data/
