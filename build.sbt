@@ -1,41 +1,26 @@
 name := "strider"
-organization := "com.outr"
-version := "0.1.0-SNAPSHOT"
 
-scalaVersion := "3.8.3"
+ThisBuild / organization := "com.outr"
+ThisBuild / version := "0.1.0-SNAPSHOT"
 
-versionScheme := Some("early-semver")
+ThisBuild / scalaVersion := "3.8.3"
 
-scalacOptions ++= Seq("-deprecation", "-feature", "-Wconf:any:silent")
+ThisBuild / versionScheme := Some("early-semver")
 
-Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-oDF")
+ThisBuild / scalacOptions ++= Seq("-deprecation", "-feature", "-Wconf:any:silent")
 
-fork := true
+ThisBuild / Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-oDF")
 
-resolvers += "jitpack" at "https://jitpack.io"
+ThisBuild / fork := true
 
-evictionErrorLevel := Level.Warn
+ThisBuild / resolvers += "jitpack" at "https://jitpack.io"
 
-// Dependency versions
-val spiceVersion = "1.6.0"
-val lightdbVersion = "4.31.0-SNAPSHOT"
-val rapidVersion = "2.9.2"
-val scalatestVersion = "3.2.20"
+ThisBuild / evictionErrorLevel := Level.Warn
 
-libraryDependencies ++= Seq(
-  "com.outr" %% "lightdb-all" % lightdbVersion,
-  "com.outr" %% "rapid-core" % rapidVersion,
-  "com.outr" %% "spice-server-undertow" % spiceVersion,
-  "com.outr" %% "spice-openapi" % spiceVersion,
+ThisBuild / licenses := Seq("MIT" -> url("https://opensource.org/licenses/MIT"))
+ThisBuild / homepage := Some(url("https://github.com/outr/strider"))
 
-  "org.scalatest" %% "scalatest" % scalatestVersion % Test,
-  "com.outr" %% "rapid-test" % rapidVersion % Test
-)
-
-licenses := Seq("Apache-2.0" -> url("https://www.apache.org/licenses/LICENSE-2.0"))
-homepage := Some(url("https://github.com/outr/strider"))
-
-developers := List(
+ThisBuild / developers := List(
   Developer(
     id = "darkfrog26",
     name = "Matt Hicks",
@@ -44,9 +29,42 @@ developers := List(
   )
 )
 
-scmInfo := Some(
+ThisBuild / scmInfo := Some(
   ScmInfo(
     url("https://github.com/outr/strider"),
     "scm:git@github.com:outr/strider.git"
   )
 )
+
+// Dependency versions
+val spiceVersion = "1.6.0"
+val lightdbVersion = "4.31.0-SNAPSHOT"
+val rapidVersion = "2.9.2"
+val scalatestVersion = "3.2.20"
+
+lazy val strider = project.in(file("."))
+  .settings(
+    name := "strider",
+    libraryDependencies ++= Seq(
+      "com.outr" %% "lightdb-all" % lightdbVersion,
+      "com.outr" %% "rapid-core" % rapidVersion,
+      "com.outr" %% "spice-server-undertow" % spiceVersion,
+      "com.outr" %% "spice-openapi" % spiceVersion,
+
+      "org.scalatest" %% "scalatest" % scalatestVersion % Test,
+      "com.outr" %% "rapid-test" % rapidVersion % Test
+    )
+  )
+
+lazy val docs = project
+  .in(file("documentation"))
+  .dependsOn(strider)
+  .enablePlugins(MdocPlugin)
+  .settings(
+    publish / skip := true,
+    mdocVariables := Map(
+      "VERSION" -> version.value
+    ),
+    mdocIn := (ThisBuild / baseDirectory).value / "docs",
+    mdocOut := (ThisBuild / baseDirectory).value
+  )
