@@ -37,7 +37,7 @@ Define workflows as a list of typed steps — jobs, triggers, conditions, approv
 ## Installation
 
 ```scala
-libraryDependencies += "com.outr" %% "strider" % "0.1.0-SNAPSHOT"
+libraryDependencies += "com.outr" %% "strider" % "1.0.0"
 ```
 
 ## Quick Start
