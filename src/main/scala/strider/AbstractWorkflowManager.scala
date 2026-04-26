@@ -543,21 +543,36 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     val pm = ProgressManager.timeDelayed(5.seconds, ProgressManager(p))
     val total = workflow.steps.map(_.weight).sum
     val current = workflow.completed.flatMap(workflow.byStepId).map(_.weight).sum
-    p.attachAndFire { p =>
+    // Per-job activity flag. The `timeDelayed` ProgressManager schedules
+    // emits up to 5s out — if a fast job completes before the scheduled
+    // emit fires, the emit would otherwise leak the previous job's message
+    // into the global `WorkflowProgress` Var (the next job's name still
+    // shows correctly because it comes from `runningId`, but the message
+    // would be the stale one). Listener checks the flag and short-circuits
+    // once `jobActive = false`. Set `false` after the deliberate
+    // `p @= Progress(Some(1.0))` below so the final 100% update lands.
+    @volatile var jobActive: Boolean = true
+    val reaction = p.attachAndFire { p =>
       try {
-        val pv = p.value.map(v => math.max(math.min(v, 1.0), 0.0))
-        val workflowProgress = (current + (pv.getOrElse(0.0) * job.weight)) / total
-        val update = ProgressUpdate(
-          workflow = workflow,
-          step = job,
-          stepProgress = pv,
-          workflowProgress = workflowProgress,
-          message = p.message
-        )
-        WorkflowProgress @= Some(update)
+        if (!jobActive) () else {
+          val pv = p.value.map(v => math.max(math.min(v, 1.0), 0.0))
+          val workflowProgress = (current + (pv.getOrElse(0.0) * job.weight)) / total
+          val update = ProgressUpdate(
+            workflow = workflow,
+            step = job,
+            stepProgress = pv,
+            workflowProgress = workflowProgress,
+            message = p.message
+          )
+          WorkflowProgress @= Some(update)
+        }
       } catch {
         case t: Throwable => scribe.error(t)
       }
+    }
+    def detachReaction(): Unit = {
+      jobActive = false
+      try { p.reactions -= reaction; () } catch { case t: Throwable => scribe.error(t) }
     }
     val startTime = System.currentTimeMillis()
     addHistory(workflow._id, WorkflowActivity.StepStarted(job.id), txn).flatMap { workflow =>
@@ -593,6 +608,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       }
       executionTask.flatMap { payload =>
         p @= Progress(Some(1.0))
+        detachReaction()
         val durationMs = System.currentTimeMillis() - startTime
         modify(workflow._id, txn) { workflow =>
           val result = StepResult(job.id, job.name, StepResultStatus.Completed, output = Some(payload), durationMs = durationMs)
@@ -608,6 +624,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
           val delay = job.retryBackoff.delayForAttempt(job.retryDelayMs, attempt)
           logger.warn(s"Step ${job.name} failed (attempt ${attempt + 1}/${job.retryCount}), retrying in ${delay}ms...").flatMap { _ =>
             p @= Progress(None)
+            detachReaction()
             addHistory(workflow._id, WorkflowActivity.StepRetrying(job.id, attempt + 1, job.retryCount), txn).flatMap { wf =>
               Task.sleep(delay.millis).flatMap { _ =>
                 executeJob(wf, job, txn, attempt + 1)
@@ -617,6 +634,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
         } else if (job.continueOnError) {
           logger.error(s"Step ${job.name} failed, continuing", throwable).flatMap { _ =>
             p @= Progress(Some(1.0))
+            detachReaction()
             val durationMs = System.currentTimeMillis() - startTime
             modify(workflow._id, txn) { workflow =>
               val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
@@ -630,6 +648,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
         } else {
           logger.error(s"Step ${job.name} failed", throwable).flatMap { _ =>
             p @= Progress(Some(1.0))
+            detachReaction()
             val durationMs = System.currentTimeMillis() - startTime
             modify(workflow._id, txn) { workflow =>
               val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
