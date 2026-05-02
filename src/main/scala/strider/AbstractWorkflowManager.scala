@@ -35,11 +35,22 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
   /** Resolve the WorkflowParent (template) for a given sourceId. Override to provide storage lookup. */
   protected def resolveParent(sourceId: Id[WorkflowParent]): Task[Option[Parent]]
 
+  /** Called when a workflow first transitions from scheduled to running.
+    * Sigil/Strider downstream consumers fold this into their event log
+    * so the run's start is visible alongside its later step / completion
+    * events. Default no-op. */
+  protected def onWorkflowStarted(workflow: Workflow): Task[Unit] = Task.unit
+
   /** Called when a workflow completes successfully. Override to add custom behavior. */
   protected def onWorkflowCompleted(workflow: Workflow): Task[Unit] = Task.unit
 
   /** Called when a workflow fails. Override to add custom behavior. */
   protected def onWorkflowFailed(workflow: Workflow): Task[Unit] = Task.unit
+
+  /** Called when a step is about to execute. Override to add custom
+    * behavior — Sigil uses this to surface a "step started" Event in
+    * the originating conversation. Default no-op. */
+  protected def onStepStarted(workflow: Workflow, stepId: Id[Step]): Task[Unit] = Task.unit
 
   /** Called when a step completes (success or failure). Override to add custom behavior. */
   protected def onStepCompleted(workflow: Workflow, stepId: Id[Step], success: Boolean): Task[Unit] = Task.unit
@@ -519,16 +530,21 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     )
     txn.upsert(w).flatMap { workflow =>
       val step = workflow.running.getOrElse(throw UserException(s"Unable to find running step ${workflow.runningId} in workflow ${workflow.name}"))
-      step match {
-        case job: Job[?] => executeJob(workflow, job, txn)
-        case trigger: Trigger => enterTriggerWait(workflow, trigger, txn)
-        case condition: Condition => evaluateCondition(workflow, condition, txn)
-        case approval: Approval => enterApprovalWait(workflow, approval, txn)
-        case parallel: Parallel => executeParallel(workflow, parallel, txn)
-        case loop: Loop => executeLoop(workflow, loop, txn)
-        case sub: SubWorkflow => executeSubWorkflow(workflow, sub, txn)
-        case _: Recycle => executeRecycle(workflow, txn)
-        case _ => Task.error(new UnsupportedOperationException(s"Step type ${step.getClass.getSimpleName} not supported"))
+      val startedHook =
+        if (workflow.completed.isEmpty) onWorkflowStarted(workflow).handleError(_ => Task.unit)
+        else Task.unit
+      startedHook.flatMap(_ => onStepStarted(workflow, stepId).handleError(_ => Task.unit)).flatMap { _ =>
+        step match {
+          case job: Job[?] => executeJob(workflow, job, txn)
+          case trigger: Trigger => enterTriggerWait(workflow, trigger, txn)
+          case condition: Condition => evaluateCondition(workflow, condition, txn)
+          case approval: Approval => enterApprovalWait(workflow, approval, txn)
+          case parallel: Parallel => executeParallel(workflow, parallel, txn)
+          case loop: Loop => executeLoop(workflow, loop, txn)
+          case sub: SubWorkflow => executeSubWorkflow(workflow, sub, txn)
+          case _: Recycle => executeRecycle(workflow, txn)
+          case _ => Task.error(new UnsupportedOperationException(s"Step type ${step.getClass.getSimpleName} not supported"))
+        }
       }
     }
   } else {
