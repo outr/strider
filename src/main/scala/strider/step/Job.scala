@@ -25,6 +25,18 @@ trait Job[Return: RW] extends Step {
   /** Serialize the return value to Json for storage in workflow payloads. */
   def executeToJson(workflow: Workflow, pm: ProgressManager): Task[Json] =
     execute(workflow, pm).map(r => r.json)
+
+  /** Variant of [[executeToJson]] that receives the runner's
+    * [[JobContext]] — gives the step a way to mutate the running
+    * workflow within the runner's own transaction. Steps that need
+    * to append next-iteration steps from inside their execute body
+    * (agent ReAct loops, dynamic step composition) override this.
+    * Default delegates to `executeToJson`, so existing jobs keep
+    * working unchanged. */
+  def executeToJsonContextualized(workflow: Workflow,
+                                  pm: ProgressManager,
+                                  ctx: JobContext): Task[Json] =
+    executeToJson(workflow, pm)
 }
 
 object Job

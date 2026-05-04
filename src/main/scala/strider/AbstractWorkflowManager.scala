@@ -593,7 +593,11 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     val startTime = System.currentTimeMillis()
     addHistory(workflow._id, WorkflowActivity.StepStarted(job.id), txn).flatMap { workflow =>
       p @= Progress()
-      val baseTask = job.executeToJson(workflow, pm)
+      val ctx: JobContext = new JobContext {
+        override def updateStepsInTxn(workflowId: Id[Workflow], newSteps: List[Step]): Task[Workflow] =
+          updateStepsIn(txn, workflowId, newSteps)
+      }
+      val baseTask = job.executeToJsonContextualized(workflow, pm, ctx)
       val executionTask = job.executionTimeoutMs match {
         case Some(timeout) =>
           Task.defer {
@@ -982,10 +986,28 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     * Recomputes the queue to include only steps not yet completed. */
   def updateSteps(workflowId: Id[Workflow], newSteps: List[Step]): Task[Workflow] =
     collection.transaction { txn =>
-      modify(workflowId, txn) { wf =>
-        val newQueue = newSteps.map(_.id).filterNot(wf.completed.contains)
-        Task.pure(wf.copy(steps = newSteps, queue = newQueue))
-      }
+      updateStepsIn(txn, workflowId, newSteps)
+    }
+
+  /** Same as [[updateSteps]] but uses the supplied transaction
+    * instead of opening a fresh one. Lets a job's execute body
+    * mutate the workflow's queue WITHIN the runner's own
+    * transaction so the new queue is visible to the runner's
+    * post-execute modify (which would otherwise read its txn-cached
+    * pre-update snapshot and clobber the change).
+    *
+    * Filters both `completed` AND `runningId` out of the new
+    * queue: when called from inside a job's execute the running
+    * step isn't yet in `completed`, but it's also already running —
+    * including its id in the queue would cause Strider's runner to
+    * pop and re-run it after settle. */
+  def updateStepsIn(txn: Transaction[Workflow, WorkflowModel],
+                    workflowId: Id[Workflow],
+                    newSteps: List[Step]): Task[Workflow] =
+    modify(workflowId, txn) { wf =>
+      val excluded = (wf.completed ++ wf.runningId.toList).toSet
+      val newQueue = newSteps.map(_.id).filterNot(excluded.contains)
+      Task.pure(wf.copy(steps = newSteps, queue = newQueue))
     }
 
   /** Propagate step changes from a parent to all active workflow instances.
