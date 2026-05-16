@@ -351,7 +351,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
                variables: Map[String, Json] = Map.empty,
                variableDefs: List[WorkflowVariable] = Nil,
                tags: Set[String] = Set.empty,
-               workflowTimeoutMs: Option[Long] = None): Task[Workflow] = {
+               workflowTimeoutMs: Option[Long] = None,
+               conversationId: Option[String] = None): Task[Workflow] = {
     val workflow = Workflow(
       name = name,
       steps = steps,
@@ -363,6 +364,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       variables = variables,
       tags = tags,
       workflowTimeoutMs = workflowTimeoutMs,
+      conversationId = conversationId,
       history = List(
         WorkflowHistory(WorkflowActivity.Scheduled(timeStamp)),
         WorkflowHistory(WorkflowActivity.Created)
