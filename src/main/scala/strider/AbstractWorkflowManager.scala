@@ -16,7 +16,8 @@ import lightdb.trigger.StoreTrigger
 import spice.UserException
 import rapid.{Fiber, FiberOps, Task, logger, RapidApp}
 
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.concurrent.duration.{DurationInt, DurationLong, FiniteDuration}
 import scala.math.Ordered.orderingToOrdered
 
@@ -31,6 +32,13 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
 
   private val changed = Var(true)
   private val activeCount = new AtomicInteger(0)
+
+  /** Per-workflow pause signal updated by [[pause]] / [[unpause]] and read
+    * by [[StatefulJobContext.checkpoint]] in the running step's hot loop.
+    * Registered when a job starts executing, removed when it ends.
+    * AtomicBoolean so concurrent checkpoint calls from a parallel stream
+    * can compare-and-set: only the first observer wins the durable write. */
+  private val pauseRefs: ConcurrentHashMap[Id[Workflow], AtomicBoolean] = new ConcurrentHashMap()
 
   /** Resolve the WorkflowParent (template) for a given sourceId. Override to provide storage lookup. */
   protected def resolveParent(sourceId: Id[WorkflowParent]): Task[Option[Parent]]
@@ -65,12 +73,29 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
     _ <- collection.transaction { txn =>
       txn.stream
-        .filter(w => w.runningId.isDefined || w.waitingStepId.isDefined)
+        .filter(w => w.runningId.isDefined || w.waitingStepId.isDefined || w.pausedStepId.isDefined)
         .foreach { w =>
-          scribe.info(s"Recovering workflow: ${w.name} (created: ${w.created}, runningId: ${w.runningId}, waitingStepId: ${w.waitingStepId})")
+          scribe.info(s"Recovering workflow: ${w.name} (created: ${w.created}, runningId: ${w.runningId}, waitingStepId: ${w.waitingStepId}, pausedStepId: ${w.pausedStepId})")
         }
         .evalMap { workflow =>
-          if (workflow.runningId.isDefined) {
+          if (workflow.pausedStepId.isDefined) {
+            // Already paused; clean up any stale runningId from a crash that
+            // happened between StatefulJobContext.checkpoint persisting and
+            // executeJob's JobPausedException handler re-queueing the step.
+            scribe.info(s"Restoring paused workflow: ${workflow.name}")
+            modify(workflow._id, txn) { workflow =>
+              val needsRequeue = workflow.runningId.exists(id => !workflow.queue.contains(id))
+              val newQueue = workflow.runningId match {
+                case Some(id) if needsRequeue => id :: workflow.queue
+                case _ => workflow.queue
+              }
+              Task.pure(workflow.copy(
+                runningId = None,
+                queue = newQueue,
+                pauseRequested = false
+              ))
+            }
+          } else if (workflow.runningId.isDefined) {
             scribe.info(s"Failing crashed workflow: ${workflow.name}")
             modify(workflow._id, txn) { workflow =>
               val stepFailure = workflow.runningId match {
@@ -313,7 +338,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       changed @= false
       txn.query
         .filter { w =>
-          w.finished === false && w.runningId === None && w.waitingStepId === None
+          w.finished === false && w.runningId === None && w.waitingStepId === None && w.pausedStepId === None
         }
         .sort(
           Sort.ByField(collection.model.priority).desc,
@@ -508,6 +533,22 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
 
   private def recurseWorkflow(workflow: Workflow,
                               txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = if (workflow.queue.nonEmpty && !workflow.finished && workflow.waitingStepId.isEmpty) {
+    // Honor a pending pause request at the step boundary. Pause-mid-step
+    // (StatefulJob) is handled in executeJob; this branch covers either
+    // (a) a plain Job that ran to completion AFTER pause was requested, or
+    // (b) a pause request that arrived between steps. Either way, transition
+    // to Paused with pausedStepId pointing at the next step in the queue.
+    if (workflow.pauseRequested) {
+      val nextStepId = workflow.queue.head
+      return modify(workflow._id, txn) { wf =>
+        Task.pure(wf.copy(
+          runningId = None,
+          pauseRequested = false,
+          pausedStepId = Some(nextStepId),
+          history = WorkflowHistory(WorkflowActivity.Paused(Some(nextStepId), Null)) :: wf.history
+        ))
+      }
+    }
     // Check workflow-level timeout
     val timedOut = for {
       timeout <- workflow.workflowTimeoutMs
@@ -593,11 +634,23 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       try { p.reactions -= reaction; () } catch { case t: Throwable => scribe.error(t) }
     }
     val startTime = System.currentTimeMillis()
+    // Per-workflow pause signal, registered for the duration of this step.
+    // Initialized from the workflow record (a pause request may have been
+    // persisted before this step's executeJob started, e.g. across a server
+    // restart). pause(workflowId) flips this for in-flight steps.
+    val pauseRef: AtomicBoolean = new AtomicBoolean(workflow.pauseRequested)
+    pauseRefs.put(workflow._id, pauseRef)
+    def unregisterPauseRef(): Unit = { pauseRefs.remove(workflow._id, pauseRef); () }
     addHistory(workflow._id, WorkflowActivity.StepStarted(job.id), txn).flatMap { workflow =>
       p @= Progress()
-      val ctx: JobContext = new JobContext {
-        override def updateStepsInTxn(workflowId: Id[Workflow], newSteps: List[Step]): Task[Workflow] =
-          updateStepsIn(txn, workflowId, newSteps)
+      val ctx: JobContext = job match {
+        case sj: StatefulJob[?, ?] =>
+          new StatefulJobContextImpl(workflow, sj, txn, pauseRef)
+        case _ =>
+          new JobContext {
+            override def updateStepsInTxn(workflowId: Id[Workflow], newSteps: List[Step]): Task[Workflow] =
+              updateStepsIn(txn, workflowId, newSteps)
+          }
       }
       val baseTask = job.executeToJsonContextualized(workflow, pm, ctx)
       val executionTask = job.executionTimeoutMs match {
@@ -631,6 +684,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       executionTask.flatMap { payload =>
         p @= Progress(Some(1.0))
         detachReaction()
+        unregisterPauseRef()
         val durationMs = System.currentTimeMillis() - startTime
         modify(workflow._id, txn) { workflow =>
           val result = StepResult(job.id, job.name, StepResultStatus.Completed, output = Some(payload), durationMs = durationMs)
@@ -638,52 +692,71 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             runningId = None,
             completed = job.id :: workflow.completed,
             payloads = workflow.payloads + (job.id -> payload),
+            // A resumed step that completes successfully consumes its checkpoint.
+            pauseCheckpoint = None,
             history = WorkflowHistory(WorkflowActivity.StepSuccess(job.id)) :: workflow.history,
           ))
         }.flatTap(wf => onStepCompleted(wf, job.id, success = true))
       }.handleError { throwable =>
-        if (attempt < job.retryCount) {
-          val delay = job.retryBackoff.delayForAttempt(job.retryDelayMs, attempt)
-          logger.warn(s"Step ${job.name} failed (attempt ${attempt + 1}/${job.retryCount}), retrying in ${delay}ms...").flatMap { _ =>
+        throwable match {
+          case _: JobPausedException =>
+            // StatefulJobContext.checkpoint already persisted pauseCheckpoint +
+            // pausedStepId and wrote the Paused activity. Re-queue this step at
+            // the head, clear runningId + pauseRequested, exit cleanly.
             p @= Progress(None)
             detachReaction()
-            addHistory(workflow._id, WorkflowActivity.StepRetrying(job.id, attempt + 1, job.retryCount), txn).flatMap { wf =>
-              Task.sleep(delay.millis).flatMap { _ =>
-                executeJob(wf, job, txn, attempt + 1)
+            unregisterPauseRef()
+            modify(workflow._id, txn) { wf =>
+              Task.pure(wf.copy(
+                runningId = None,
+                queue = job.id :: wf.queue,
+                pauseRequested = false
+              ))
+            }
+          case _ if attempt < job.retryCount =>
+            val delay = job.retryBackoff.delayForAttempt(job.retryDelayMs, attempt)
+            logger.warn(s"Step ${job.name} failed (attempt ${attempt + 1}/${job.retryCount}), retrying in ${delay}ms...").flatMap { _ =>
+              p @= Progress(None)
+              detachReaction()
+              addHistory(workflow._id, WorkflowActivity.StepRetrying(job.id, attempt + 1, job.retryCount), txn).flatMap { wf =>
+                Task.sleep(delay.millis).flatMap { _ =>
+                  executeJob(wf, job, txn, attempt + 1)
+                }
               }
             }
-          }
-        } else if (job.continueOnError) {
-          logger.error(s"Step ${job.name} failed, continuing", throwable).flatMap { _ =>
-            p @= Progress(Some(1.0))
-            detachReaction()
-            val durationMs = System.currentTimeMillis() - startTime
-            modify(workflow._id, txn) { workflow =>
-              val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
-              Task.pure(addStepResult(workflow, result).copy(
-                runningId = None,
-                completed = job.id :: workflow.completed,
-                history = WorkflowHistory(WorkflowActivity.StepFailure(job.id, s"${job.name} failed with ${throwable.getMessage}")) :: workflow.history,
-              ))
-            }.flatTap(wf => onStepCompleted(wf, job.id, success = false))
-          }
-        } else {
-          logger.error(s"Step ${job.name} failed", throwable).flatMap { _ =>
-            p @= Progress(Some(1.0))
-            detachReaction()
-            val durationMs = System.currentTimeMillis() - startTime
-            modify(workflow._id, txn) { workflow =>
-              val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
-              Task.pure(addStepResult(workflow, result).copy(
-                runningId = None,
-                completed = job.id :: workflow.completed,
-                history =
-                  WorkflowHistory(WorkflowActivity.Completed(false)) ::
-                    WorkflowHistory(WorkflowActivity.StepFailure(job.id, s"${job.name} failed with ${throwable.getMessage}")) ::
-                    workflow.history,
-              ))
-            }.flatTap(wf => onStepCompleted(wf, job.id, success = false))
-          }
+          case _ if job.continueOnError =>
+            logger.error(s"Step ${job.name} failed, continuing", throwable).flatMap { _ =>
+              p @= Progress(Some(1.0))
+              detachReaction()
+              unregisterPauseRef()
+              val durationMs = System.currentTimeMillis() - startTime
+              modify(workflow._id, txn) { workflow =>
+                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
+                Task.pure(addStepResult(workflow, result).copy(
+                  runningId = None,
+                  completed = job.id :: workflow.completed,
+                  history = WorkflowHistory(WorkflowActivity.StepFailure(job.id, s"${job.name} failed with ${throwable.getMessage}")) :: workflow.history,
+                ))
+              }.flatTap(wf => onStepCompleted(wf, job.id, success = false))
+            }
+          case _ =>
+            logger.error(s"Step ${job.name} failed", throwable).flatMap { _ =>
+              p @= Progress(Some(1.0))
+              detachReaction()
+              unregisterPauseRef()
+              val durationMs = System.currentTimeMillis() - startTime
+              modify(workflow._id, txn) { workflow =>
+                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
+                Task.pure(addStepResult(workflow, result).copy(
+                  runningId = None,
+                  completed = job.id :: workflow.completed,
+                  history =
+                    WorkflowHistory(WorkflowActivity.Completed(false)) ::
+                      WorkflowHistory(WorkflowActivity.StepFailure(job.id, s"${job.name} failed with ${throwable.getMessage}")) ::
+                      workflow.history,
+                ))
+              }.flatTap(wf => onStepCompleted(wf, job.id, success = false))
+            }
         }
       }
     }.flatMap { workflow =>
@@ -1072,9 +1145,127 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
   }
 
+  /** Request a cooperative pause of the workflow.
+    *
+    * If the running step is a [[StatefulJob]] that calls
+    * `ctx.checkpoint(state)` periodically, it will see the request on its
+    * next checkpoint call, persist its state, and exit via
+    * [[JobPausedException]] — the workflow transitions to Paused with the
+    * paused step at the head of the queue.
+    *
+    * If the running step is a plain [[Job]] (or any other step), pause is
+    * deferred until that step completes — the workflow then transitions to
+    * Paused at the next step boundary in [[recurseWorkflow]]. */
+  def pause(workflowId: Id[Workflow]): Task[Workflow] = {
+    collection.transaction { txn =>
+      txn.get(workflowId).flatMap {
+        case Some(workflow) if !workflow.finished && !workflow.paused =>
+          modify(workflow._id, txn) { wf =>
+            Task.pure(wf.copy(
+              pauseRequested = true,
+              history = WorkflowHistory(WorkflowActivity.PauseRequested(wf.runningId)) :: wf.history
+            ))
+          }.map { wf =>
+            // Mirror to the in-memory flag so a running StatefulJob sees the
+            // request without re-reading the DB on every checkpoint call.
+            Option(pauseRefs.get(wf._id)).foreach(_.set(true))
+            wf
+          }
+        case Some(workflow) =>
+          Task.pure(workflow)
+        case None =>
+          Task.error(UserException(s"Workflow $workflowId not found"))
+      }
+    }
+  }
+
+  /** Resume a paused workflow.
+    *
+    * Clears `pausedStepId` so the runner picks the workflow up; the paused
+    * step is already at the head of the queue (re-queued by the runner when
+    * the pause took effect). `pauseCheckpoint` is left in place — the
+    * resuming [[StatefulJob]] reads it via `ctx.resumeFrom` and clears it on
+    * successful completion. */
+  def unpause(workflowId: Id[Workflow]): Task[Workflow] = {
+    collection.transaction { txn =>
+      txn.get(workflowId).flatMap {
+        case Some(workflow) if workflow.paused =>
+          modify(workflow._id, txn) { wf =>
+            Task.pure(wf.copy(
+              pauseRequested = false,
+              pausedStepId = None,
+              history = WorkflowHistory(WorkflowActivity.Unpaused) :: wf.history
+            ))
+          }.map { wf =>
+            changed @= true
+            wf
+          }
+        case Some(workflow) =>
+          Task.pure(workflow)
+        case None =>
+          Task.error(UserException(s"Workflow $workflowId not found"))
+      }
+    }
+  }
+
+  /** Runner-constructed [[StatefulJobContext]]. Reads/writes the workflow's
+    * `pauseCheckpoint` field via the supplied txn, consults `pauseRef` for
+    * the cooperative pause signal, and uses the job's `stateRW` to
+    * serialize the typed state to/from Json.
+    *
+    * The State type is erased here (declared as `Any`) and recovered by the
+    * unsafe cast in `StatefulJob.executeToJsonContextualized`. The runner
+    * is the only construction site, so the cast is safe by construction. */
+  private class StatefulJobContextImpl(
+    initialWorkflow: Workflow,
+    job: StatefulJob[?, ?],
+    txn: Transaction[Workflow, WorkflowModel],
+    pauseRef: AtomicBoolean
+  ) extends StatefulJobContext[Any] {
+    private val stateRW: RW[Any] = job.stateRW.asInstanceOf[RW[Any]]
+
+    override def resumeFrom: Option[Any] = {
+      // Only honor the checkpoint when it was written by THIS step. After a
+      // successful prior step, pauseCheckpoint is cleared; if a different
+      // step paused, its pausedStepId would point elsewhere and we ignore.
+      if (initialWorkflow.pausedStepId.contains(job.id) ||
+          // Resume path: unpause cleared pausedStepId but left pauseCheckpoint.
+          // If the workflow has a checkpoint AND no pausedStepId set AND this
+          // step is the head (which the runner just popped), treat it as ours.
+          (initialWorkflow.pausedStepId.isEmpty && initialWorkflow.pauseCheckpoint.isDefined)) {
+        initialWorkflow.pauseCheckpoint.map(j => j.as[Any](using stateRW))
+      } else {
+        None
+      }
+    }
+
+    override def checkpoint(state: => Any): Task[Boolean] = {
+      // Fast path: no pause requested.
+      if (!pauseRef.get()) Task.pure(false)
+      // CAS gate: under parallel `par(N)` execution every worker can race
+      // here. Only the first to flip wins the DB write; the rest still
+      // return `true` so they also throw and exit the stream cleanly.
+      else if (!pauseRef.compareAndSet(true, false)) Task.pure(true)
+      else {
+        val stateJson: Json = state.json(using stateRW)
+        modify(initialWorkflow._id, txn) { wf =>
+          Task.pure(wf.copy(
+            pausedStepId = Some(job.id),
+            pauseCheckpoint = Some(stateJson),
+            history = WorkflowHistory(WorkflowActivity.Paused(Some(job.id), stateJson)) :: wf.history
+          ))
+        }.map(_ => true)
+      }
+    }
+
+    override def updateStepsInTxn(workflowId: Id[Workflow], newSteps: List[Step]): Task[Workflow] =
+      updateStepsIn(txn, workflowId, newSteps)
+  }
+
   def dispose(): Task[Unit] = {
     keepAlive = false
     activeCount.set(0)
+    pauseRefs.clear()
     if (monitorFiber != null) {
       monitorFiber.cancel.unit
     } else {

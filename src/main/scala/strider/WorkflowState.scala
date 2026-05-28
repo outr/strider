@@ -14,7 +14,9 @@ object WorkflowState {
   def started(history: List[WorkflowHistory]): Boolean =
     history.exists(_.activity == WorkflowActivity.Starting)
 
-  def status(history: List[WorkflowHistory], waitingStepId: Option[Id[Step]]): WorkflowStatus = {
+  def status(history: List[WorkflowHistory],
+             waitingStepId: Option[Id[Step]],
+             pausedStepId: Option[Id[Step]] = None): WorkflowStatus = {
     if (finished(history)) {
       history.collectFirst { case h if h.activity.isInstanceOf[WorkflowActivity.Completed] =>
         h.activity.asInstanceOf[WorkflowActivity.Completed]
@@ -26,6 +28,8 @@ object WorkflowState {
       WorkflowStatus.Cancelled
     } else if (history.exists(_.activity.isInstanceOf[WorkflowActivity.TimedOut])) {
       WorkflowStatus.TimedOut
+    } else if (pausedStepId.isDefined) {
+      WorkflowStatus.Paused
     } else if (waitingStepId.isDefined) {
       WorkflowStatus.Waiting
     } else if (started(history)) {

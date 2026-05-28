@@ -20,6 +20,9 @@ case class Workflow(name: String,
                     runningId: Option[Id[Step]] = None,
                     waitingStepId: Option[Id[Step]] = None,
                     waitingSince: Option[Long] = None,
+                    pauseRequested: Boolean = false,
+                    pausedStepId: Option[Id[Step]] = None,
+                    pauseCheckpoint: Option[Json] = None,
                     completed: List[Id[Step]] = Nil,
                     payloads: Map[Id[Step], Json] = Map.empty,
                     stepResults: List[StepResult] = Nil,
@@ -56,6 +59,8 @@ case class Workflow(name: String,
       priority = priority,
       runningId = runningId,
       waitingStepId = waitingStepId,
+      pausedStepId = pausedStepId,
+      pauseRequested = pauseRequested,
       stepProgress = progress.flatMap(_.stepProgress),
       stepMessage = progress.flatMap(_.message),
       workflowProgress = progress.map(_.workflowProgress),
@@ -83,5 +88,6 @@ case class Workflow(name: String,
   lazy val payload: Option[Json] = completed.headOption.flatMap(payloads.get)
   lazy val finished: Boolean = WorkflowState.finished(history)
   lazy val started: Boolean = WorkflowState.started(history)
-  lazy val status: WorkflowStatus = WorkflowState.status(history, waitingStepId)
+  lazy val paused: Boolean = pausedStepId.isDefined
+  lazy val status: WorkflowStatus = WorkflowState.status(history, waitingStepId, pausedStepId)
 }

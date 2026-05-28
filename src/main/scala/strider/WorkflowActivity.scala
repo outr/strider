@@ -26,6 +26,9 @@ object WorkflowActivity {
     RW.gen[ChildWorkflowCompleted],
     RW.static(Cancelled),
     RW.gen[TimedOut],
+    RW.gen[PauseRequested],
+    RW.gen[Paused],
+    RW.static(Unpaused),
     RW.gen[Completed]
   )
 
@@ -54,6 +57,14 @@ object WorkflowActivity {
 
   case object Cancelled extends WorkflowActivity
   case class TimedOut(stepId: Option[Id[Step]]) extends WorkflowActivity
+
+  /** User requested pause; the running step will honor it at its next safe checkpoint. */
+  case class PauseRequested(stepId: Option[Id[Step]]) extends WorkflowActivity
+  /** Step has cooperatively paused. `checkpoint` carries the State the StatefulJob persisted
+   *  (Null for non-stateful pauses that happened between steps). */
+  case class Paused(stepId: Option[Id[Step]], checkpoint: Json) extends WorkflowActivity
+  /** Workflow was unpaused — the next monitor tick will pick it up and resume the head of the queue. */
+  case object Unpaused extends WorkflowActivity
 
   case class Completed(success: Boolean) extends WorkflowActivity
 

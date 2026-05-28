@@ -13,6 +13,8 @@ case class WorkflowPreview(name: String,
                            priority: Double,
                            runningId: Option[Id[Step]],
                            waitingStepId: Option[Id[Step]],
+                           pausedStepId: Option[Id[Step]] = None,
+                           pauseRequested: Boolean = false,
                            stepProgress: Option[Double],
                            stepMessage: Option[String],
                            workflowProgress: Option[Double],
@@ -27,5 +29,6 @@ case class WorkflowPreview(name: String,
   lazy val activity: WorkflowActivity = WorkflowState.activity(history)
   lazy val finished: Boolean = WorkflowState.finished(history)
   lazy val started: Boolean = WorkflowState.started(history)
-  lazy val status: WorkflowStatus = WorkflowState.status(history, waitingStepId)
+  lazy val paused: Boolean = pausedStepId.isDefined
+  lazy val status: WorkflowStatus = WorkflowState.status(history, waitingStepId, pausedStepId)
 }
