@@ -692,6 +692,10 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             runningId = None,
             completed = job.id :: workflow.completed,
             payloads = workflow.payloads + (job.id -> payload),
+            // Thread the payload into a named workflow variable when the job declares one, so a
+            // later step can reference it via {{name}} — the single-step analogue of Loop's
+            // outputVariable. No declaration leaves variables untouched.
+            variables = job.outputVariable.fold(workflow.variables)(v => workflow.variables + (v -> payload)),
             // A resumed step that completes successfully consumes its checkpoint.
             pauseCheckpoint = None,
             history = WorkflowHistory(WorkflowActivity.StepSuccess(job.id)) :: workflow.history,

@@ -22,6 +22,12 @@ trait Job[Return: RW] extends Step {
    */
   def execute(workflow: Workflow, pm: ProgressManager): Task[Return]
 
+  /** Optional workflow-variable name to write this job's payload into on success (in addition to
+    * `payloads`), so a later step can reference the result via `{{name}}` substitution. Mirrors
+    * [[strider.step.Loop.outputVariable]] for single steps. `None` (default) writes only to
+    * `payloads`, leaving existing jobs unchanged. */
+  def outputVariable: Option[String] = None
+
   /** Serialize the return value to Json for storage in workflow payloads. */
   def executeToJson(workflow: Workflow, pm: ProgressManager): Task[Json] =
     execute(workflow, pm).map(r => r.json)

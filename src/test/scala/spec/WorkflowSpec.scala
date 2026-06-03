@@ -571,6 +571,19 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         hookEvents.count(_ == s"step:${loop.id.value}:true") should be(1)
       }
     }
+    "write a top-level job's payload into its outputVariable" in {
+      val job = ReverseTextJob(Right("threadme"), outVar = Some("r"))
+      for {
+        w <- WorkflowManager.schedule("JobOutputVar", steps = List(job), sourceId = testSourceId)
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        finished.status should be(WorkflowStatus.Success)
+        // The payload is written to both payloads(stepId) and the named variable, so a later step
+        // can reference it via {{r}}.
+        finished.variables.get("r") should be(Some(str("emdaerht")))
+        finished.payloads.get(job.id) should be(Some(str("emdaerht")))
+      }
+    }
     "reject resume on wrong stepId" in {
       val trigger = TestTrigger()
       for {
@@ -998,7 +1011,10 @@ object WorkflowManager extends AbstractWorkflowManager[WorkflowParent, WorkflowM
   }
 }
 
-case class ReverseTextJob(text: Either[Id[Step], String], id: Id[Step] = Step.id()) extends Job[String] {
+case class ReverseTextJob(text: Either[Id[Step], String],
+                          id: Id[Step] = Step.id(),
+                          outVar: Option[String] = None) extends Job[String] {
+  override def outputVariable: Option[String] = outVar
   override def execute(workflow: Workflow, pm: ProgressManager): Task[String] = Task {
     val string = text match {
       case Left(jobId) => workflow.payloads(jobId).asString
