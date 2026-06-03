@@ -855,7 +855,9 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             history = WorkflowHistory(WorkflowActivity.StepSuccess(parallel.id)) :: w.history
           ))
         }
-      }.flatMap(recurseWorkflow(_, txn))
+      // Surface the Parallel container itself as a completed step.
+      }.flatTap(wf => onStepCompleted(wf, parallel.id, success = true).handleError(_ => Task.unit))
+        .flatMap(recurseWorkflow(_, txn))
     }
   }
 
@@ -876,6 +878,11 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
                 payloads = wf.payloads + (stepId -> payload)
               )
             }
+            // Fire the step-completed hook for every body/branch step, not just top-level Jobs. Loop
+            // iterations and Parallel branches do their work here; without this a workflow whose
+            // steps run inside a Loop/Parallel emits zero `onStepCompleted` events, so its per-item
+            // progress is invisible to observers driving progress UIs off the hook.
+            .flatTap(updated => onStepCompleted(updated, stepId, success = true).handleError(_ => Task.unit))
           case _ => Task.pure(wf)
         }
       }
@@ -924,7 +931,10 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             history = WorkflowHistory(WorkflowActivity.StepSuccess(loop.id)) :: w.history
           ))
         }
-      }.flatMap(recurseWorkflow(_, txn))
+      // Surface the Loop container itself as a completed step (one event when the whole loop finishes,
+      // in addition to the per-iteration body-step events from executeBranch).
+      }.flatTap(wf => onStepCompleted(wf, loop.id, success = true).handleError(_ => Task.unit))
+        .flatMap(recurseWorkflow(_, txn))
     }
   }
 

@@ -546,6 +546,31 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         finished.variables.contains("results") should be(true)
       }
     }
+    "emit step-completed events for loop body steps and the loop container" in {
+      val bodyJob = ReverseTextJob(Right("loop-body"))
+      val loop = Loop(
+        itemsVariable = "items",
+        bodySteps = List(bodyJob.id),
+        itemVariableName = "item",
+        outputVariable = "results"
+      )
+      hookEvents = Nil
+      for {
+        w <- WorkflowManager.schedule("LoopStepEvents353",
+          steps = List(bodyJob, loop),
+          sourceId = testSourceId,
+          variables = Map("items" -> fabric.arr(str("a"), str("b"), str("c")))
+        )
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        finished.status should be(WorkflowStatus.Success)
+        // Before this fix the loop body emitted ZERO step-completed events; the run showed
+        // started -> (nothing) -> completed. Now each iteration's body step fires (3 items, plus
+        // the one top-level run of the same job = 4) and the Loop container fires exactly once.
+        hookEvents.count(_.startsWith(s"step:${bodyJob.id.value}:")) should be >= 4
+        hookEvents.count(_ == s"step:${loop.id.value}:true") should be(1)
+      }
+    }
     "reject resume on wrong stepId" in {
       val trigger = TestTrigger()
       for {
