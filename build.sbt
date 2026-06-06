@@ -46,7 +46,7 @@ ThisBuild / developers := List(
 )
 
 // Dependency versions
-val spiceVersion = "1.9.0"
+val spiceVersion = "1.9.1"
 
 val lightdbVersion = "4.40.0"
 
