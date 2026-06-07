@@ -546,6 +546,42 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         finished.variables.contains("results") should be(true)
       }
     }
+    "coerce a non-array loop source (text blob / {text} / {results}) into items" in {
+      // A discovery step's result reaches the loop as its `output` variable,
+      // but it isn't always a JSON array: grep/glob yield a text blob, and
+      // coalesced messages yield `{"results":[...]}`. The loop must iterate
+      // those shapes so `find -> Loop -> act` composes without a hand-built
+      // array. The loop's output collects one entry per iteration, so its
+      // size is the item count.
+      def loopCount(source: Json): rapid.Task[Int] = {
+        val bodyJob = ReverseTextJob(Right("x"))
+        val loop = Loop(
+          itemsVariable = "src",
+          bodySteps = List(bodyJob.id),
+          itemVariableName = "item",
+          outputVariable = "out"
+        )
+        for {
+          w <- WorkflowManager.schedule("CoerceLoopTest",
+            steps = List(bodyJob, loop),
+            sourceId = testSourceId,
+            variables = Map("src" -> source)
+          )
+          finished <- WorkflowManager.waitForFinished(w._id)
+        } yield finished.variables.get("out").map(_.asVector.size).getOrElse(-1)
+      }
+      for {
+        fromString  <- loopCount(str("a\nb\nc"))
+        fromText    <- loopCount(obj("text" -> str("x\ny")))
+        fromResults <- loopCount(obj("results" -> fabric.arr(str("p"), str("q"), str("r"), str("s"))))
+        fromArray   <- loopCount(fabric.arr(str("only")))
+      } yield {
+        fromString should be(3)
+        fromText should be(2)
+        fromResults should be(4)
+        fromArray should be(1)
+      }
+    }
     "emit step-completed events for loop body steps and the loop container" in {
       val bodyJob = ReverseTextJob(Right("loop-body"))
       val loop = Loop(

@@ -2,7 +2,7 @@ package strider
 
 import strider.step.*
 
-import fabric.{Json, Null, num}
+import fabric.{Arr, Json, Null, Obj, Str, num, str}
 import fabric.rw._
 import lightdb.store.Collection
 import reactify.{Channel, Val, Var}
@@ -893,14 +893,39 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
   }
 
+  /** Coerce a loop source value into iteration items:
+    *   - a JSON array iterates as-is;
+    *   - a string splits into non-empty, trimmed lines (a text blob from a
+    *     discovery step such as `grep`/`glob`);
+    *   - an object exposes a text blob via a `text` field (split into lines)
+    *     or a list via its first array field (`{"results":[...]}`,
+    *     `{"files":[...]}`);
+    *   - anything else yields no items. */
+  private[strider] def loopItems(json: Json): Vector[Json] = json match {
+    case Arr(values, _) => values
+    case Str(s, _)      => splitTextLines(s)
+    case Obj(map) =>
+      map.get("text") match {
+        case Some(Str(s, _)) => splitTextLines(s)
+        case _               => map.values.collectFirst { case Arr(values, _) => values }.getOrElse(Vector.empty)
+      }
+    case _ => Vector.empty
+  }
+
+  private def splitTextLines(s: String): Vector[Json] =
+    s.linesIterator.map(_.trim).filter(_.nonEmpty).map(line => (str(line): Json)).toVector
+
   private def executeLoop(workflow: Workflow,
                            loop: Loop,
                            txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = {
     addHistory(workflow._id, WorkflowActivity.StepStarted(loop.id), txn).flatMap { wf =>
-      val items = wf.variables.get(loop.itemsVariable) match {
-        case Some(json) => json.asVector
-        case None => Vector.empty
-      }
+      // Coerce the loop source into items. A discovery step's result is
+      // already threaded here (its payload, and its `output` variable), but
+      // it isn't always a JSON array: `grep`/`glob` yield a text blob
+      // (`{"text":"A\nB"}`); coalesced messages yield `{"results":[...]}`.
+      // Accept those shapes so `find -> Loop -> act` composes without the
+      // author hand-building an array; a plain array is used as-is.
+      val items = wf.variables.get(loop.itemsVariable).fold(Vector.empty[Json])(loopItems)
       // Save variables that will be overwritten by loop iteration (for scope isolation)
       val savedVarNames = Set(loop.itemVariableName, s"${loop.itemVariableName}_index", s"${loop.itemVariableName}_total")
       val savedVars = wf.variables.filter { case (k, _) => savedVarNames.contains(k) }
