@@ -360,7 +360,16 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             }.handleError { throwable =>
               activeCount.decrementAndGet()
               scribe.error(s"Workflow ${workflow.name} failed unexpectedly", throwable)
-              Task.pure(0L)
+              // An exception that escapes the per-step failure handling (e.g.
+              // thrown from a Job body running under executeBranch, which has
+              // no per-step handleError) used to leave the row mid-run and
+              // never fire onWorkflowFailed, so lifecycle observers hung on a
+              // stale "running" state with no failure surfaced. Settle the run
+              // as finished+Failure and invoke the failure hook so observers
+              // see a terminal outcome.
+              markFailedUnexpectedly(workflow._id, throwable, txn)
+                .handleError(t => logger.error(s"Failed to settle ${workflow.name} after unexpected failure", t).map(_ => ()))
+                .map(_ => 0L)
             }
           case None =>
             Task.pure(System.currentTimeMillis() + 5_000L)
@@ -1084,6 +1093,29 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
   private def addStepResult(workflow: Workflow, result: StepResult): Workflow = {
     workflow.copy(stepResults = result :: workflow.stepResults)
   }
+
+  /** Settle a run that threw an unexpected exception escaping the per-step
+    * failure handling. Mirrors the normal job-failure path: record
+    * a `StepFailure` (the running step, if any) + `Completed(false)` in history
+    * — which derives `finished` + `Failure` status — clear `runningId`, then
+    * invoke [[onWorkflowFailed]] so observers see a terminal outcome instead of
+    * a stale "running" row. No-op if the run already settled. */
+  private def markFailedUnexpectedly(workflowId: Id[Workflow],
+                                     throwable: Throwable,
+                                     transaction: Transaction[Workflow, WorkflowModel]): Task[Unit] =
+    transaction.get(workflowId).flatMap {
+      case Some(wf) if !wf.finished =>
+        modify(workflowId, transaction) { w =>
+          val failureNote = w.runningId
+            .map(id => WorkflowHistory(WorkflowActivity.StepFailure(id, s"failed unexpectedly: ${throwable.getMessage}")))
+            .toList
+          Task.pure(w.copy(
+            runningId = None,
+            history = WorkflowHistory(WorkflowActivity.Completed(false)) :: failureNote ::: w.history
+          ))
+        }.flatMap(updated => onWorkflowFailed(updated))
+      case _ => Task.unit
+    }
 
   private def unregisterIfTrigger(workflow: Workflow, stepId: Id[Step]): Task[Unit] = {
     workflow.byStepId(stepId) match {
