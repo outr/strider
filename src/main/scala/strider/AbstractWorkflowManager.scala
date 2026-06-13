@@ -888,7 +888,13 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             job.executeToJson(wf, pm).map { payload =>
               wf.copy(
                 completed = stepId :: wf.completed,
-                payloads = wf.payloads + (stepId -> payload)
+                payloads = wf.payloads + (stepId -> payload),
+                // Thread a body/branch step's outputVariable into `variables` so a
+                // LATER step in the same Loop iteration / Parallel branch can
+                // reference it via {{var}} — exactly as top-level executeJob does.
+                // Without this only the loop's itemVariable resolved; a sibling
+                // step's output came through as the unresolved literal.
+                variables = job.outputVariable.fold(wf.variables)(v => wf.variables + (v -> payload))
               )
             }
             // Fire the step-completed hook for every body/branch step, not just top-level Jobs. Loop
