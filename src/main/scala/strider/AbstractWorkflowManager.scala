@@ -882,28 +882,70 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     stepIds.foldLeft(Task.pure(branchWorkflow)) { (wfTask, stepId) =>
       wfTask.flatMap { wf =>
         wf.byStepId(stepId) match {
-          case Some(job: Job[?]) =>
-            val p = Var(Progress(None))
-            val pm = ProgressManager(p)
-            job.executeToJson(wf, pm).map { payload =>
-              wf.copy(
-                completed = stepId :: wf.completed,
-                payloads = wf.payloads + (stepId -> payload),
-                // Thread a body/branch step's outputVariable into `variables` so a
-                // LATER step in the same Loop iteration / Parallel branch can
-                // reference it via {{var}} — exactly as top-level executeJob does.
-                // Without this only the loop's itemVariable resolved; a sibling
-                // step's output came through as the unresolved literal.
-                variables = job.outputVariable.fold(wf.variables)(v => wf.variables + (v -> payload))
-              )
-            }
-            // Fire the step-completed hook for every body/branch step, not just top-level Jobs. Loop
-            // iterations and Parallel branches do their work here; without this a workflow whose
-            // steps run inside a Loop/Parallel emits zero `onStepCompleted` events, so its per-item
-            // progress is invisible to observers driving progress UIs off the hook.
-            .flatTap(updated => onStepCompleted(updated, stepId, success = true).handleError(_ => Task.unit))
-          case _ => Task.pure(wf)
+          case Some(job: Job[?]) => executeBranchJob(wf, job, txn, attempt = 0)
+          case _                 => Task.pure(wf)
         }
+      }
+    }
+  }
+
+  /**
+   * Run one Loop-body / Parallel-branch [[Job]] with the SAME failure handling
+   * top-level [[executeJob]] gets — `retryCount` retries with backoff, then
+   * `continueOnError` to record the failure and proceed. Previously a branch
+   * step's body ran `executeToJson` raw, so a transient provider error in a
+   * loop iteration propagated straight to `runNextScheduled` and crashed the
+   * ENTIRE run (every remaining iteration abandoned). A non-`continueOnError`
+   * failure still propagates here — `executeLoop` catches it and isolates it to
+   * the single iteration, so one bad item never nukes the loop.
+   */
+  private def executeBranchJob(wf: Workflow,
+                               job: Job[?],
+                               txn: Transaction[Workflow, WorkflowModel],
+                               attempt: Int): Task[Workflow] = {
+    val p = Var(Progress(None))
+    val pm = ProgressManager(p)
+    job.executeToJson(wf, pm).map { payload =>
+      wf.copy(
+        completed = job.id :: wf.completed,
+        payloads = wf.payloads + (job.id -> payload),
+        // Thread a body/branch step's outputVariable into `variables` so a
+        // LATER step in the same Loop iteration / Parallel branch can
+        // reference it via {{var}} — exactly as top-level executeJob does.
+        // Without this only the loop's itemVariable resolved; a sibling
+        // step's output came through as the unresolved literal.
+        variables = job.outputVariable.fold(wf.variables)(v => wf.variables + (v -> payload))
+      )
+    }
+    // Fire the step-completed hook for every body/branch step, not just top-level Jobs. Loop
+    // iterations and Parallel branches do their work here; without this a workflow whose
+    // steps run inside a Loop/Parallel emits zero `onStepCompleted` events, so its per-item
+    // progress is invisible to observers driving progress UIs off the hook.
+    .flatTap(updated => onStepCompleted(updated, job.id, success = true).handleError(_ => Task.unit))
+    .handleError { throwable =>
+      throwable match {
+        case _ if attempt < job.retryCount =>
+          val delay = job.retryBackoff.delayForAttempt(job.retryDelayMs, attempt)
+          logger.warn(s"Branch step ${job.name} failed (attempt ${attempt + 1}/${job.retryCount}), retrying in ${delay}ms...").flatMap { _ =>
+            addHistory(wf._id, WorkflowActivity.StepRetrying(job.id, attempt + 1, job.retryCount), txn).flatMap { w =>
+              Task.sleep(delay.millis).flatMap(_ => executeBranchJob(w, job, txn, attempt + 1))
+            }
+          }
+        case _ if job.continueOnError =>
+          logger.error(s"Branch step ${job.name} failed, continuing", throwable).flatMap { _ =>
+            modify(wf._id, txn) { w =>
+              val result = StepResult(job.id, job.name, StepResultStatus.Failed, error = Some(throwable.getMessage))
+              Task.pure(addStepResult(w, result).copy(
+                completed = job.id :: w.completed,
+                payloads = w.payloads + (job.id -> Null),
+                history = WorkflowHistory(WorkflowActivity.StepFailure(job.id, s"${job.name} failed with ${throwable.getMessage}")) :: w.history
+              ))
+            }.flatTap(w => onStepCompleted(w, job.id, success = false).handleError(_ => Task.unit))
+          }
+        // No retries left and not continue-on-error: propagate so the caller
+        // decides. `executeLoop` isolates this to the current iteration; a
+        // Parallel branch (or any other caller) fails the run as before.
+        case _ => Task.error(throwable)
       }
     }
   }
@@ -957,6 +999,16 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
               executeBranch(w, loop.bodySteps, txn).map { branchResult =>
                 val output = branchResult.completed.headOption.flatMap(branchResult.payloads.get).getOrElse(Null)
                 (branchResult, results :+ output)
+              }.handleError { throwable =>
+                // #389 — isolate a body failure to THIS iteration: record it and
+                // carry on with the next item, rather than letting one bad item
+                // abort every remaining iteration. The failure is captured in the
+                // loop's results (as `{"error": ...}`) and the run history.
+                logger.error(s"Loop ${loop.id.value} iteration $index failed, continuing", throwable).flatMap { _ =>
+                  addHistory(iterWf._id, WorkflowActivity.StepFailure(loop.id, s"iteration $index failed with ${throwable.getMessage}"), txn).map { w2 =>
+                    (w2, results :+ (Obj("error" -> str(throwable.getMessage)): Json))
+                  }
+                }
               }
             }
           }

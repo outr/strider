@@ -546,6 +546,38 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         finished.variables.contains("results") should be(true)
       }
     }
+    "isolate a failing loop iteration — one bad item doesn't abort the whole loop (#389)" in {
+      // Pre-fix a loop-body step's failure propagated straight to
+      // runNextScheduled and failed the ENTIRE run, abandoning every remaining
+      // iteration. Now a body failure is isolated to its iteration: the loop
+      // records it and carries on, so the run still succeeds and every item is
+      // attempted.
+      val bodyJob = LoopItemFailJob()
+      val loop = Loop(
+        itemsVariable = "items",
+        bodySteps = List(bodyJob.id),
+        itemVariableName = "item",
+        outputVariable = "results"
+      )
+      for {
+        w <- WorkflowManager.schedule("LoopIsolationTest",
+          steps = List(bodyJob, loop),
+          sourceId = testSourceId,
+          variables = Map("items" -> fabric.arr(str("ok1"), str("boom"), str("ok2")))
+        )
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        // The run survives the bad item.
+        finished.status should be(WorkflowStatus.Success)
+        // Every item was attempted — three result entries (two reversed, one error).
+        finished.variables.get("results") match {
+          case Some(fabric.Arr(values, _)) =>
+            values should have size 3
+            values.map(_.toString).mkString should (include("1ko").and(include("2ko")).and(include("error")))
+          case other => fail(s"expected a 3-element results array, got: $other")
+        }
+      }
+    }
     "coerce a non-array loop source (text blob / {text} / {results}) into items" in {
       // A discovery step's result reaches the loop as its `output` variable,
       // but it isn't always a JSON array: grep/glob yield a text blob, and
@@ -1023,7 +1055,7 @@ object WorkflowModel extends AbstractWorkflowModel {
   // We use RW.poly's lazy resolution — SubWorkflow's RW is defined after stepRW but
   // registered as part of the poly which resolves lazily at first use (after init).
   override implicit lazy val stepRW: RW[Step] = RW.poly()(
-    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[TimedJob],
+    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[LoopItemFailJob], RW.gen[TimedJob],
     RW.gen[RetryableJob], RW.gen[ContinueOnErrorJob], RW.gen[ExponentialBackoffJob], RW.gen[TimeoutJob],
     RW.gen[ThrowInHandleErrorJob], RW.gen[StreamErrorButSucceedsJob], RW.gen[NestedStreamErrorJob],
     RW.gen[TestTrigger], RW.gen[TestCondition], RW.gen[TestApproval], RW.gen[BranchTrigger],
@@ -1063,6 +1095,16 @@ case class ReverseTextJob(text: Either[Id[Step], String],
 case class FailingJob(id: Id[Step] = Step.id()) extends Job[Json] {
   override def execute(workflow: Workflow, pm: ProgressManager): Task[Json] =
     Task.error(new RuntimeException("Expected failure!"))
+}
+
+/** Reads the loop's `item` variable and fails only for the item "boom",
+  * reversing any other item. Models a single bad item among many. */
+case class LoopItemFailJob(id: Id[Step] = Step.id()) extends Job[String] {
+  override def execute(workflow: Workflow, pm: ProgressManager): Task[String] = Task {
+    val item = workflow.variables.get("item").map(_.asString).getOrElse("")
+    if (item == "boom") throw new RuntimeException(s"boom on '$item'")
+    item.reverse
+  }
 }
 
 case class TimedJob(time: FiniteDuration, override val weight: Double = 1.0, id: Id[Step] = Step.id()) extends Job[Json] {
