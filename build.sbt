@@ -10,7 +10,7 @@ val developerURL: String = "https://matthicks.com"
 name := projectName
 
 ThisBuild / organization := org
-ThisBuild / version := "1.1.4"
+ThisBuild / version := "1.1.5"
 
 ThisBuild / scalaVersion := "3.8.4"
 
@@ -46,11 +46,11 @@ ThisBuild / developers := List(
 )
 
 // Dependency versions
-val spiceVersion = "1.10.1"
+val spiceVersion = "1.10.2"
 
-val lightdbVersion = "4.43.0"
+val lightdbVersion = "4.44.0"
 
-val rapidVersion = "2.9.8"
+val rapidVersion = "2.9.9"
 
 val scalatestVersion = "3.2.20"
 
