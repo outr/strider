@@ -1391,14 +1391,19 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       updateStepsIn(txn, workflowId, newSteps)
   }
 
-  def dispose(): Task[Unit] = {
+  def dispose(): Task[Unit] = Task {
+    // Clear keepAlive and return immediately — the monitor's loop checks it at
+    // the top of each iteration and self-terminates. We deliberately do NOT
+    // interrupt the monitor fiber: it runs the current step inline, so a hard
+    // cancel would interrupt that step mid-work — typically inside a store
+    // transaction — leaving a lock held and deadlocking the subsequent store
+    // dispose. (This was a no-op `cancel` before rapid added real interruption;
+    // it relied on keepAlive then, and does so explicitly now.) An in-flight
+    // step is therefore abandoned — its workflow row stays `running` and is
+    // recovered as crashed on the next manager start, which is the intended
+    // shutdown-mid-run semantics.
     keepAlive = false
     activeCount.set(0)
     pauseRefs.clear()
-    if (monitorFiber != null) {
-      monitorFiber.cancel.unit
-    } else {
-      Task.unit
-    }
   }
 }
