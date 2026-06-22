@@ -578,6 +578,63 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         }
       }
     }
+    "abort a loop that fails identically every iteration after K consecutive failures (#393)" in {
+      // #389 isolates a flaky one-off, but a systematically mis-wired loop (bad
+      // tool args, a missing precondition) fails the SAME way on every item.
+      // Continuing to isolate grinds silently through all items and the failure
+      // never surfaces. After K (=3) consecutive identical-signature failures
+      // the run must ABORT (WorkflowStatus.Failure) so the repeated error reaches
+      // the run history — that's what #390's terminal-wake hands the scheduling
+      // agent to fix and re-run.
+      val bodyJob = FailingJob() // always errors with the same message
+      val loop = Loop(
+        itemsVariable = "items",
+        bodySteps = List(bodyJob.id),
+        itemVariableName = "item",
+        outputVariable = "results"
+      )
+      for {
+        w <- WorkflowManager.schedule("LoopSystematicFailTest",
+          // loop first so it aborts before bodyJob would run as a top-level step;
+          // bodyJob is registered only so the loop can resolve it via byStepId.
+          steps = List(loop, bodyJob),
+          sourceId = testSourceId,
+          variables = Map("items" -> fabric.arr(str("a"), str("b"), str("c"), str("d"), str("e")))
+        )
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        finished.status should be(WorkflowStatus.Failure)
+        // The repeated error is preserved in the run history, not swallowed.
+        finished.history.map(_.activity.toString).mkString should include("Expected failure!")
+      }
+    }
+    "NOT abort when identical failures are non-consecutive — the streak resets on success (#393)" in {
+      // The systematic-failure cap counts CONSECUTIVE identical failures, not a
+      // total. Three failures separated by successes is a flaky source, not a
+      // systematic one — the loop must isolate each and still complete.
+      val bodyJob = LoopItemFailJob() // fails only for item "boom"
+      val loop = Loop(
+        itemsVariable = "items",
+        bodySteps = List(bodyJob.id),
+        itemVariableName = "item",
+        outputVariable = "results"
+      )
+      for {
+        w <- WorkflowManager.schedule("LoopNonConsecutiveFailTest",
+          steps = List(bodyJob, loop),
+          sourceId = testSourceId,
+          variables = Map("items" -> fabric.arr(str("boom"), str("ok"), str("boom"), str("ok"), str("boom")))
+        )
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        // Three failures total, but never three in a row → the run survives.
+        finished.status should be(WorkflowStatus.Success)
+        finished.variables.get("results") match {
+          case Some(fabric.Arr(values, _)) => values should have size 5
+          case other                       => fail(s"expected a 5-element results array, got: $other")
+        }
+      }
+    }
     "coerce a non-array loop source (text blob / {text} / {results}) into items" in {
       // A discovery step's result reaches the loop as its `output` variable,
       // but it isn't always a JSON array: grep/glob yield a text blob, and

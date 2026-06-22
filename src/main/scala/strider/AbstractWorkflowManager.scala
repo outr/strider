@@ -987,8 +987,18 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       val savedVarNames = Set(loop.itemVariableName, s"${loop.itemVariableName}_index", s"${loop.itemVariableName}_total")
       val savedVars = wf.variables.filter { case (k, _) => savedVarNames.contains(k) }
 
-      val resultsTask = items.zipWithIndex.foldLeft(Task.pure((wf, Vector.empty[Json]))) { case (acc, (item, index)) =>
-        acc.flatMap { case (currentWf, results) =>
+      // #393 — abort once a loop fails the SAME way this many times in a row.
+      // A flaky one-off must isolate-and-continue (#389), but K consecutive
+      // identical-signature failures is a systematically mis-wired loop: keep
+      // isolating and the run grinds invisibly through every item with the same
+      // error and never surfaces. Aborting fails the run → the terminal-wake
+      // (#390) hands the scheduling agent the repeated error to fix and re-run.
+      val systematicFailureThreshold = 3
+      // Accumulator: (workflow, per-iteration results, consecutive-failure streak,
+      // last failure signature). The streak resets to 0 on any success.
+      val seed = (wf, Vector.empty[Json], 0, Option.empty[String])
+      val resultsTask = items.zipWithIndex.foldLeft(Task.pure(seed)) { case (acc, (item, index)) =>
+        acc.flatMap { case (currentWf, results, consecFails, lastSig) =>
           addHistory(currentWf._id, WorkflowActivity.LoopIteration(loop.id, index), txn).flatMap { iterWf =>
             val iterVars = iterWf.variables +
               (loop.itemVariableName -> item) +
@@ -998,22 +1008,30 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             iterWorkflow.flatMap { w =>
               executeBranch(w, loop.bodySteps, txn).map { branchResult =>
                 val output = branchResult.completed.headOption.flatMap(branchResult.payloads.get).getOrElse(Null)
-                (branchResult, results :+ output)
+                (branchResult, results :+ output, 0, Option.empty[String]) // success resets the streak
               }.handleError { throwable =>
-                // #389 — isolate a body failure to THIS iteration: record it and
-                // carry on with the next item, rather than letting one bad item
-                // abort every remaining iteration. The failure is captured in the
-                // loop's results (as `{"error": ...}`) and the run history.
-                logger.error(s"Loop ${loop.id.value} iteration $index failed, continuing", throwable).flatMap { _ =>
-                  addHistory(iterWf._id, WorkflowActivity.StepFailure(loop.id, s"iteration $index failed with ${throwable.getMessage}"), txn).map { w2 =>
-                    (w2, results :+ (Obj("error" -> str(throwable.getMessage)): Json))
+                val sig    = Option(throwable.getMessage).getOrElse(throwable.getClass.getName)
+                val streak = if (lastSig.contains(sig)) consecFails + 1 else 1
+                if (streak >= systematicFailureThreshold) {
+                  // Systematic failure — stop isolating and abort the run.
+                  logger.error(s"Loop ${loop.id.value}: $streak consecutive identical failures — aborting run (systematic, not flaky)", throwable).flatMap { _ =>
+                    Task.error(new RuntimeException(
+                      s"Loop '${loop.id.value}' failed $streak iterations in a row with the same error — aborting the run " +
+                        s"(systematic failure, not a flaky item): ${throwable.getMessage}"))
+                  }
+                } else {
+                  // #389 — isolate a body failure to THIS iteration and carry on.
+                  logger.error(s"Loop ${loop.id.value} iteration $index failed, continuing", throwable).flatMap { _ =>
+                    addHistory(iterWf._id, WorkflowActivity.StepFailure(loop.id, s"iteration $index failed with ${throwable.getMessage}"), txn).map { w2 =>
+                      (w2, results :+ (Obj("error" -> str(throwable.getMessage)): Json), streak, Some(sig))
+                    }
                   }
                 }
               }
             }
           }
         }
-      }
+      }.map { case (w, results, _, _) => (w, results) }
       resultsTask.flatMap { case (loopWf, results) =>
         val resultJson = fabric.arr(results: _*)
         modify(loopWf._id, txn) { w =>
