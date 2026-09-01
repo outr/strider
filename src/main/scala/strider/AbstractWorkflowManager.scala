@@ -33,6 +33,12 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
   private val changed = Var(true)
   private val activeCount = new AtomicInteger(0)
 
+  /** Workflows a fork is currently executing. `runningId` is briefly cleared to None between steps
+    * (see recurseWorkflow's step completion), so the `runningId === None` selection filter alone
+    * would re-pick a still-executing workflow in that window and run it a second time (duplicating
+    * `completed`). Membership here excludes it from re-selection until its fork finishes. */
+  private val executing = java.util.concurrent.ConcurrentHashMap.newKeySet[Id[Workflow]]()
+
   /** Per-workflow pause signal updated by [[pause]] / [[unpause]] and read
     * by [[StatefulJobContext.checkpoint]] in the running step's hot loop.
     * Registered when a job starts executing, removed when it ends.
@@ -67,6 +73,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     _ <- logger.info("Initializing Workflow Manager...")
     _ = keepAlive = true
     _ = activeCount.set(0)
+    _ = executing.clear()
     _ = collection.trigger += new StoreTrigger[Workflow, WorkflowModel] {
       override def insert(doc: Workflow, transaction: Transaction[Workflow, WorkflowModel]): Task[Unit] = Task(changed @= true)
       override def upsert(doc: Workflow, transaction: Transaction[Workflow, WorkflowModel]): Task[Unit] = Task(changed @= true)
@@ -331,49 +338,81 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
   }
 
-  private def runNextScheduled(): Task[Long] = collection.transaction { txn =>
+  private def runNextScheduled(): Task[Long] = {
+    // Reset up front (not only on the else path): when the slots are full this must clear too, or
+    // `changed` stays true and the monitor tight-loops instead of sleeping, starving the very
+    // workflow fibers it just forked. It is set true again only when a workflow is actually started,
+    // to force one immediate re-check that fills any remaining slot.
+    changed @= false
     if (activeCount.get() >= maxConcurrentWorkflows) {
       Task.pure(System.currentTimeMillis() + 1_000L)
     } else {
-      changed @= false
-      txn.query
-        .filter { w =>
-          w.finished === false && w.runningId === None && w.waitingStepId === None && w.pausedStepId === None
-        }
-        .sort(
-          Sort.ByField(collection.model.priority).desc,
-          Sort.ByField(collection.model.scheduled).asc
-        )
-        .limit(1)
-        .firstOption
-        .flatMap {
-          case Some(workflow) if workflow.scheduled > System.currentTimeMillis() =>
-            Task.pure(workflow.scheduled)
-          case Some(workflow) =>
-            scribe.info(s"Executing ${workflow.name}")
-            activeCount.incrementAndGet()
-            changed @= true
-            executeWorkflow(workflow, txn).map { _ =>
-              activeCount.decrementAndGet()
-              scribe.info(s"Finished execute for ${workflow.name}")
-              0L
-            }.handleError { throwable =>
-              activeCount.decrementAndGet()
-              scribe.error(s"Workflow ${workflow.name} failed unexpectedly", throwable)
-              // An exception that escapes the per-step failure handling (e.g.
-              // thrown from a Job body running under executeBranch, which has
-              // no per-step handleError) used to leave the row mid-run and
-              // never fire onWorkflowFailed, so lifecycle observers hung on a
-              // stale "running" state with no failure surfaced. Settle the run
-              // as finished+Failure and invoke the failure hook so observers
-              // see a terminal outcome.
-              markFailedUnexpectedly(workflow._id, throwable, txn)
-                .handleError(t => logger.error(s"Failed to settle ${workflow.name} after unexpected failure", t).map(_ => ()))
-                .map(_ => 0L)
+      // Select AND claim (persist runningId) the next workflow in one short transaction, then run
+      // it in its OWN transaction. A workflow holds its transaction for its whole lifetime
+      // (recurseWorkflow), so concurrent workflows cannot share one; and claiming before the fork
+      // returns keeps the next selection from re-picking a workflow whose execution has not yet
+      // recorded runningId. `Left` = nothing to run now, wait until; `Right` = run this claimed one.
+      collection.transaction { txn =>
+        txn.query
+          .filter { w =>
+            w.finished === false && w.runningId === None && w.waitingStepId === None && w.pausedStepId === None
+          }
+          .sort(
+            Sort.ByField(collection.model.priority).desc,
+            Sort.ByField(collection.model.scheduled).asc
+          )
+          .limit(1)
+          .firstOption
+          .flatMap {
+            case Some(workflow) if workflow.scheduled > System.currentTimeMillis() =>
+              Task.pure(Left[Long, Workflow](workflow.scheduled))
+            case Some(workflow) if workflow.queue.nonEmpty && !executing.contains(workflow._id) =>
+              // Claim it: mark it in-flight (so the inter-step runningId=None window can't re-select
+              // it) and persist runningId. recurseWorkflow re-pops this same head step, so the claim
+              // neither skips nor double-runs it.
+              executing.add(workflow._id)
+              modify(workflow._id, txn)(w => Task.pure(w.copy(runningId = Some(w.queue.head))))
+                .map(Right[Long, Workflow](_))
+            case Some(_) =>
+              // Queue empty, or already being executed by a fork — back off briefly.
+              Task.pure(Left[Long, Workflow](System.currentTimeMillis() + 1_000L))
+            case None =>
+              Task.pure(Left[Long, Workflow](System.currentTimeMillis() + 5_000L))
+          }
+      }.flatMap {
+        case Left(nextTime) => Task.pure(nextTime)
+        case Right(workflow) =>
+          scribe.info(s"Executing ${workflow.name}")
+          activeCount.incrementAndGet()
+          changed @= true
+          val run = collection.transaction { wfTxn =>
+            wfTxn.get(workflow._id).flatMap {
+              case Some(fresh) if !fresh.finished =>
+                executeWorkflow(fresh, wfTxn).handleError { throwable =>
+                  scribe.error(s"Workflow ${workflow.name} failed unexpectedly", throwable)
+                  // An exception that escapes the per-step failure handling (e.g.
+                  // thrown from a Job body running under executeBranch, which has
+                  // no per-step handleError) used to leave the row mid-run and
+                  // never fire onWorkflowFailed, so lifecycle observers hung on a
+                  // stale "running" state with no failure surfaced. Settle the run
+                  // as finished+Failure and invoke the failure hook so observers
+                  // see a terminal outcome.
+                  markFailedUnexpectedly(fresh._id, throwable, wfTxn)
+                    .handleError(t => logger.error(s"Failed to settle ${workflow.name} after unexpected failure", t).map(_ => ()))
+                    .map(_ => ())
+                }
+              case _ => Task.unit
             }
-          case None =>
-            Task.pure(System.currentTimeMillis() + 5_000L)
-        }
+          }.guarantee(Task {
+            executing.remove(workflow._id)
+            activeCount.decrementAndGet()
+            scribe.info(s"Finished execute for ${workflow.name}")
+          })
+          // With more than one slot, fork so the monitor loop returns immediately and
+          // starts the next scheduled workflow; otherwise await to preserve the single
+          // slot's serial semantics.
+          if (maxConcurrentWorkflows > 1) run.start.map(_ => 0L) else run.map(_ => 0L)
+      }
     }
   }
 
@@ -1326,6 +1365,12 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
   }
 
+  /** Whether a pause/stop has been requested for a currently-running step of this workflow. Reads
+    * the in-memory per-workflow pause flag registered for the duration of an in-flight step, so a
+    * plain [[Job]] (not just a [[StatefulJob]] with a context) can poll it and drain gracefully. */
+  def isPausing(workflowId: Id[Workflow]): Boolean =
+    Option(pauseRefs.get(workflowId)).exists(_.get())
+
   /** Resume a paused workflow.
     *
     * Clears `pausedStepId` so the runner picks the workflow up; the paused
@@ -1423,5 +1468,6 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     keepAlive = false
     activeCount.set(0)
     pauseRefs.clear()
+    executing.clear()
   }
 }

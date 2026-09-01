@@ -48,6 +48,35 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
       }
       WorkflowManager.init().map(_ => succeed)
     }
+    "run two workflows at once when maxConcurrentWorkflows > 1" in {
+      ConcProbe.reset()
+      for {
+        _ <- ConcurrentManager.init()
+        a <- ConcurrentManager.schedule("CA", List(ConcProbeJob(1500L)), testSourceId)
+        b <- ConcurrentManager.schedule("CB", List(ConcProbeJob(1500L)), testSourceId)
+        _ <- ConcurrentManager.waitForFinished(a._id)
+        _ <- ConcurrentManager.waitForFinished(b._id)
+        // A serial manager would peak at 1; concurrency peaks at 2.
+      } yield ConcProbe.max.get() should be(2)
+    }
+    "not double-execute a workflow's steps under concurrency" in {
+      // runningId is briefly None between steps; the forking monitor must not re-select and re-run
+      // a workflow that is already executing, or `completed` accumulates duplicates. Several short
+      // steps give multiple inter-step windows to race on.
+      val steps = List(
+        TimedJob(120.millis), TimedJob(120.millis), TimedJob(120.millis),
+        TimedJob(120.millis), TimedJob(120.millis), TimedJob(120.millis)
+      )
+      for {
+        _ <- ConcurrentManager.init()
+        w <- ConcurrentManager.schedule("NODUP", steps, testSourceId)
+        fin <- ConcurrentManager.waitForFinished(w._id)
+      } yield {
+        fin.finished should be(true)
+        fin.completed.distinct.length should be(fin.completed.length)
+        fin.completed.length should be(steps.length)
+      }
+    }
 //    "hide error logging of failed jobs" in {
 //      Logger("strider.AbstractWorkflowManager").withMinimumLevel(Level.Fatal).replace()
 //      succeed
@@ -1103,6 +1132,8 @@ object db extends LightDB {
 
   val workflows: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel)()
 
+  val workflowsConcurrent: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel).withName("workflowsConcurrent")()
+
   override def directory: Option[Path] = Some(Path.of("db", "workflows"))
   override def upgrades: List[DatabaseUpgrade] = Nil
 }
@@ -1112,7 +1143,7 @@ object WorkflowModel extends AbstractWorkflowModel {
   // We use RW.poly's lazy resolution — SubWorkflow's RW is defined after stepRW but
   // registered as part of the poly which resolves lazily at first use (after init).
   override implicit lazy val stepRW: RW[Step] = RW.poly()(
-    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[LoopItemFailJob], RW.gen[TimedJob],
+    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[LoopItemFailJob], RW.gen[TimedJob], RW.gen[ConcProbeJob],
     RW.gen[RetryableJob], RW.gen[ContinueOnErrorJob], RW.gen[ExponentialBackoffJob], RW.gen[TimeoutJob],
     RW.gen[ThrowInHandleErrorJob], RW.gen[StreamErrorButSucceedsJob], RW.gen[NestedStreamErrorJob],
     RW.gen[TestTrigger], RW.gen[TestCondition], RW.gen[TestApproval], RW.gen[BranchTrigger],
@@ -1134,6 +1165,10 @@ object WorkflowManager extends AbstractWorkflowManager[WorkflowParent, WorkflowM
   override protected def onStepCompleted(workflow: Workflow, stepId: Id[Step], success: Boolean): Task[Unit] = Task {
     hookEvents = s"step:${stepId.value}:$success" :: hookEvents
   }
+}
+
+object ConcurrentManager extends AbstractWorkflowManager[WorkflowParent, WorkflowModel.type](db.workflowsConcurrent, maxConcurrentWorkflows = 2) {
+  override protected def resolveParent(sourceId: Id[WorkflowParent]): Task[Option[WorkflowParent]] = Task.pure(None)
 }
 
 case class ReverseTextJob(text: Either[Id[Step], String],
@@ -1162,6 +1197,24 @@ case class LoopItemFailJob(id: Id[Step] = Step.id()) extends Job[String] {
     if (item == "boom") throw new RuntimeException(s"boom on '$item'")
     item.reverse
   }
+}
+
+object ConcProbe {
+  val now = new java.util.concurrent.atomic.AtomicInteger(0)
+  val max = new java.util.concurrent.atomic.AtomicInteger(0)
+  def reset(): Unit = { now.set(0); max.set(0) }
+}
+
+/** Tracks peak simultaneous executions so a test can prove real concurrency. */
+case class ConcProbeJob(millis: Long, id: Id[Step] = Step.id()) extends Job[Json] {
+  override def execute(workflow: Workflow, pm: ProgressManager): Task[Json] =
+    Task {
+      val c = ConcProbe.now.incrementAndGet()
+      ConcProbe.max.updateAndGet(m => math.max(m, c))
+    }.flatMap(_ => Task.sleep(millis.millis)).map { _ =>
+      ConcProbe.now.decrementAndGet()
+      Null
+    }
 }
 
 case class TimedJob(time: FiniteDuration, override val weight: Double = 1.0, id: Id[Step] = Step.id()) extends Job[Json] {
