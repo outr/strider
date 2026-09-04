@@ -12,7 +12,7 @@ name := projectName
 ThisBuild / organization := org
 ThisBuild / version := "1.1.6"
 
-ThisBuild / scalaVersion := "3.8.4"
+ThisBuild / scalaVersion := "3.9.0"
 
 ThisBuild / versionScheme := Some("early-semver")
 
