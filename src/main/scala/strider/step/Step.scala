@@ -14,6 +14,11 @@ trait Step {
 
   /** Optional timeout for this step's execution in milliseconds. None means no timeout. */
   def executionTimeoutMs: Option[Long] = None
+
+  /** Named resources this step uses heavily, such as a disk or a rate-limited API. A manager with a limit for a resource
+    * runs at most that many top-level job steps holding it at once, across all its workflows; a step waits for its
+    * permits before it starts. Steps inside a Parallel or Loop body do not take permits. */
+  def resources: Set[String] = Set.empty
 }
 
 object Step {

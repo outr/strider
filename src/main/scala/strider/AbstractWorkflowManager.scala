@@ -16,7 +16,7 @@ import lightdb.trigger.StoreTrigger
 import spice.UserException
 import rapid.{Fiber, FiberOps, Task, logger, RapidApp}
 
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap, Semaphore}
 import scala.annotation.tailrec
 import scala.jdk.CollectionConverters.*
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
@@ -27,7 +27,10 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     val collection: Collection[Workflow, WorkflowModel],
     maxConcurrentWorkflows: Int = 1,
     /** How a workflow that states no [[ConcurrencyMode]] of its own treats another of the same name already running. */
-    defaultConcurrency: ConcurrencyMode = ConcurrencyMode.Fail
+    defaultConcurrency: ConcurrencyMode = ConcurrencyMode.Fail,
+    /** The most top-level job steps that may hold each named resource at once (see [[strider.step.Step.resources]]). A
+      * resource with no entry is unlimited. */
+    resourceLimits: Map[String, Int] = Map.empty
 ) {
   @volatile private var keepAlive = true
   @volatile private var monitorFiber: Fiber[Unit] = _
@@ -52,6 +55,9 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
 
   /** Running workflows already cancelled to make way for a [[ConcurrencyMode.CancelAndRestart]] workflow. */
   private val cancelling = java.util.concurrent.ConcurrentHashMap.newKeySet[Id[Workflow]]()
+
+  private val resourceSemaphores: Map[String, Semaphore] =
+    resourceLimits.collect { case (resource, limit) if limit > 0 => resource -> new Semaphore(limit, true) }
 
   /** How many due workflows one selection looks past a workflow it cannot start yet. */
   private val CandidateLimit = 100
@@ -392,6 +398,9 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
         Selection.Wait(if (passedOver) math.min(workflow.scheduled, now + 1_000L) else workflow.scheduled, cancel)
       case workflow :: tail if workflow.queue.isEmpty || executing.contains(workflow._id) =>
         next(tail, passedOver = true, cancel)
+      case workflow :: tail if workflow.byStepId(workflow.queue.head).exists(step => !resourcesFree(step)) =>
+        // Its first step would only wait for a resource, holding a slot another workflow could use.
+        next(tail, passedOver = true, cancel)
       case workflow :: tail =>
         val running = runningInstancesOf(workflow)
         val predecessor = Option(continuations.get(workflow._id))
@@ -677,7 +686,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     for {
       started <- if (!workflow.started) addHistory(workflow._id, WorkflowActivity.Starting, txn) else Task.pure(workflow)
       wf <- recurseWorkflow(started, txn)
-      _ <- addHistory(workflow._id, WorkflowActivity.Completed(true), txn).when(!wf.finished && wf.waitingStepId.isEmpty)
+      _ <- addHistory(workflow._id, WorkflowActivity.Completed(true), txn).when(!wf.finished && wf.waitingStepId.isEmpty && wf.pausedStepId.isEmpty)
       final_ <- txn.get(workflow._id).map(_.get)
       _ <- if (final_.finished && final_.status == WorkflowStatus.Success) onWorkflowCompleted(final_)
            else if (final_.finished && final_.status == WorkflowStatus.Failure) onWorkflowFailed(final_)
@@ -688,7 +697,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
   }
 
   private def recurseWorkflow(workflow: Workflow,
-                              txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = if (workflow.queue.nonEmpty && !workflow.finished && workflow.waitingStepId.isEmpty) {
+                              txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = if (workflow.queue.nonEmpty && !workflow.finished && workflow.waitingStepId.isEmpty && workflow.pausedStepId.isEmpty) {
     // Honor a pending pause request at the step boundary. Pause-mid-step
     // (StatefulJob) is handled in executeJob; this branch covers either
     // (a) a plain Job that ran to completion AFTER pause was requested, or
@@ -750,10 +759,84 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     Task.pure(workflow)
   }
 
+  private enum ResourceWait {
+    case Held(permits: List[Semaphore])
+    case Paused
+    case Cancelled
+  }
+
+  /** The limited resources a step needs, in a fixed order so two steps needing the same pair cannot deadlock. */
+  private def limitedResourcesOf(step: Step): List[(String, Semaphore)] =
+    step.resources.toList.sorted.flatMap(r => resourceSemaphores.get(r).map(r -> _))
+
+  /** Whether every limited resource the step needs has a permit free now. */
+  private def resourcesFree(step: Step): Boolean = limitedResourcesOf(step).forall(_._2.availablePermits() > 0)
+
+  /** A job step, run once it holds a permit for every limited resource it declares. The permits are held across its
+    * retries and released before the workflow moves on to its next step. */
   private def executeJob(workflow: Workflow,
                          job: Job[?],
-                         txn: Transaction[Workflow, WorkflowModel],
-                         attempt: Int = 0): Task[Workflow] = {
+                         txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = {
+    val limited = limitedResourcesOf(job)
+    val run: Task[Workflow] =
+      if (limited.isEmpty) runJob(workflow, job, txn)
+      else awaitResources(workflow, job, limited).flatMap {
+        case ResourceWait.Held(permits) =>
+          runJob(workflow, job, txn).guarantee(Task(permits.foreach(_.release())))
+        case ResourceWait.Paused =>
+          // Paused before it started: park the workflow at this step, as a pause between steps does.
+          modify(workflow._id, txn) { wf =>
+            Task.pure(wf.copy(
+              runningId = None,
+              queue = job.id :: wf.queue.filterNot(_ == job.id),
+              pauseRequested = false,
+              pausedStepId = Some(job.id),
+              history = WorkflowHistory(WorkflowActivity.Paused(Some(job.id), Null)) :: wf.history
+            ))
+          }
+        case ResourceWait.Cancelled =>
+          txn.get(workflow._id).map(_.getOrElse(workflow))
+      }
+    run.flatMap(wf => recurseWorkflow(wf, txn))
+  }
+
+  /** Waits for a permit on each resource in turn, giving up if the workflow is paused or cancelled meanwhile. */
+  private def awaitResources(workflow: Workflow, job: Job[?], limited: List[(String, Semaphore)]): Task[ResourceWait] = {
+    val pauseRef = new AtomicBoolean(workflow.pauseRequested)
+    pauseRefs.put(workflow._id, pauseRef)
+    val total = workflow.steps.map(_.weight).sum
+    val current = workflow.completed.flatMap(workflow.byStepId).map(_.weight).sum
+    def release(held: List[Semaphore]): Unit = held.foreach(_.release())
+    def loop(held: List[Semaphore], rest: List[(String, Semaphore)], announced: Option[String], lastCheck: Long): Task[ResourceWait] = rest match {
+      case Nil => Task.pure(ResourceWait.Held(held))
+      case (resource, semaphore) :: tail =>
+        Task(semaphore.tryAcquire(1, java.util.concurrent.TimeUnit.SECONDS)).flatMap {
+          case true => loop(semaphore :: held, tail, announced, lastCheck)
+          case false if pauseRef.get() =>
+            release(held)
+            Task.pure(ResourceWait.Paused)
+          case false =>
+            if (!announced.contains(resource)) {
+              scribe.info(s"${workflow.name}: ${job.name} is waiting for $resource")
+              WorkflowProgress @= Some(ProgressUpdate(workflow, job, None, if (total > 0) current / total else 0.0, Some(s"Waiting for $resource")))
+            }
+            val now = System.currentTimeMillis()
+            if (now - lastCheck < 5_000L) loop(held, rest, Some(resource), lastCheck)
+            else collection.transaction(_.get(workflow._id)).flatMap {
+              case Some(wf) if !wf.finished => loop(held, rest, Some(resource), now)
+              case _ =>
+                release(held)
+                Task.pure(ResourceWait.Cancelled)
+            }
+        }
+    }
+    loop(Nil, limited, None, System.currentTimeMillis()).guarantee(Task { pauseRefs.remove(workflow._id, pauseRef); () })
+  }
+
+  private def runJob(workflow: Workflow,
+                     job: Job[?],
+                     txn: Transaction[Workflow, WorkflowModel],
+                     attempt: Int = 0): Task[Workflow] = {
     val p = Var(Progress(None))
     val pm = ProgressManager.timeDelayed(5.seconds, ProgressManager(p))
     val total = workflow.steps.map(_.weight).sum
@@ -880,7 +963,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
               detachReaction()
               addHistory(workflow._id, WorkflowActivity.StepRetrying(job.id, attempt + 1, job.retryCount), txn).flatMap { wf =>
                 Task.sleep(delay.millis).flatMap { _ =>
-                  executeJob(wf, job, txn, attempt + 1)
+                  runJob(wf, job, txn, attempt + 1)
                 }
               }
             }
@@ -919,8 +1002,6 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             }
         }
       }
-    }.flatMap { workflow =>
-      recurseWorkflow(workflow, txn)
     }
   }
 

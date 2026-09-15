@@ -26,6 +26,22 @@ import java.nio.file.Path
 import scala.concurrent.duration.{DurationLong, FiniteDuration}
 
 class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
+  private def awaitStartedIn(manager: AbstractWorkflowManager[?, ?], id: Id[Workflow]): Task[Unit] = manager.byId(id).flatMap {
+    case Some(w) if w.started => Task.unit
+    case _ => Task.sleep(25.millis).flatMap(_ => awaitStartedIn(manager, id))
+  }
+
+  /** Waits until the workflow has claimed the step at `index` (its queue has moved past the steps before it). */
+  private def awaitRunningStepIn(manager: AbstractWorkflowManager[?, ?], id: Id[Workflow], index: Int): Task[Unit] = manager.byId(id).flatMap {
+    case Some(w) if w.completed.length >= index && w.runningId.nonEmpty => Task.unit
+    case _ => Task.sleep(25.millis).flatMap(_ => awaitRunningStepIn(manager, id, index))
+  }
+
+  private def awaitStatusIn(manager: AbstractWorkflowManager[?, ?], id: Id[Workflow], status: WorkflowStatus): Task[Workflow] = manager.byId(id).flatMap {
+    case Some(w) if w.status == status => Task.pure(w)
+    case _ => Task.sleep(50.millis).flatMap(_ => awaitStatusIn(manager, id, status))
+  }
+
   private def awaitStarted(id: Id[Workflow]): Task[Unit] = ConcurrentManager.byId(id).flatMap {
     case Some(w) if w.started => Task.unit
     case _ => Task.sleep(25.millis).flatMap(_ => awaitStarted(id))
@@ -55,6 +71,9 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
     }
     "truncate the concurrent manager's collection" in {
       db.workflowsConcurrent.transaction(_.truncate.map(_ => succeed))
+    }
+    "truncate the resource manager's collection" in {
+      db.workflowsResource.transaction(_.truncate.map(_ => succeed))
     }
     "initialize manager" in {
       WorkflowProgress.attach {
@@ -148,6 +167,56 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         runs <- awaitRuns("RECYCLED", 3)
       } yield {
         runs.map(_.status).distinct should be(List(WorkflowStatus.Success))
+      }
+    }
+    "run at most the limit of steps holding a resource at once, across workflows" in {
+      ConcProbe.reset()
+      for {
+        _ <- ResourceManager.init()
+        a <- ResourceManager.schedule("DISK-A", List(DiskProbeJob(800L)), testSourceId)
+        b <- ResourceManager.schedule("DISK-B", List(DiskProbeJob(800L)), testSourceId)
+        aDone <- ResourceManager.waitForFinished(a._id)
+        bDone <- ResourceManager.waitForFinished(b._id)
+      } yield {
+        aDone.status should be(WorkflowStatus.Success)
+        bDone.status should be(WorkflowStatus.Success)
+        ConcProbe.max.get() should be(1)
+      }
+    }
+    "not hold back a step that uses no limited resource" in {
+      ConcProbe.reset()
+      for {
+        _ <- ResourceManager.init()
+        disk <- ResourceManager.schedule("DISK-C", List(DiskProbeJob(1500L)), testSourceId)
+        _ <- awaitStartedIn(ResourceManager, disk._id)
+        free <- ResourceManager.schedule("FREE", List(ConcProbeJob(300L)), testSourceId)
+        freeDone <- ResourceManager.waitForFinished(free._id)
+        diskDone <- ResourceManager.waitForFinished(disk._id)
+      } yield {
+        freeDone.status should be(WorkflowStatus.Success)
+        // The free workflow finished while the disk step still held its permit.
+        val freeEnded = freeDone.history.collectFirst { case h if h.activity.isInstanceOf[WorkflowActivity.Completed] => h.created }.get
+        val diskEnded = diskDone.history.collectFirst { case h if h.activity.isInstanceOf[WorkflowActivity.Completed] => h.created }.get
+        freeEnded should be < diskEnded
+      }
+    }
+    "park a workflow paused while it waits for a resource, and run it once unpaused" in {
+      for {
+        _ <- ResourceManager.init()
+        holder <- ResourceManager.schedule("DISK-HOLD", List(TimedJob(200.millis), DiskProbeJob(2500L)), testSourceId)
+        _ <- awaitRunningStepIn(ResourceManager, holder._id, 1)
+        waiter <- ResourceManager.schedule("DISK-WAIT", List(TimedJob(100.millis), DiskProbeJob(100L)), testSourceId)
+        _ <- awaitRunningStepIn(ResourceManager, waiter._id, 1)
+        _ <- ResourceManager.pause(waiter._id)
+        parked <- awaitStatusIn(ResourceManager, waiter._id, WorkflowStatus.Paused)
+        holderDone <- ResourceManager.waitForFinished(holder._id)
+        _ <- ResourceManager.unpause(waiter._id)
+        waiterDone <- ResourceManager.waitForFinished(waiter._id)
+      } yield {
+        parked.pausedStepId should be(Some(waiter.steps(1).id))
+        holderDone.status should be(WorkflowStatus.Success)
+        waiterDone.status should be(WorkflowStatus.Success)
+        waiterDone.completed.length should be(2)
       }
     }
 //    "hide error logging of failed jobs" in {
@@ -1206,6 +1275,7 @@ object db extends LightDB {
   val workflows: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel)()
 
   val workflowsConcurrent: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel).withName("workflowsConcurrent")()
+  val workflowsResource: Collection[Workflow, WorkflowModel.type] = store(WorkflowModel).withName("workflowsResource")()
 
   override def directory: Option[Path] = Some(Path.of("db", "workflows"))
   override def upgrades: List[DatabaseUpgrade] = Nil
@@ -1216,7 +1286,7 @@ object WorkflowModel extends AbstractWorkflowModel {
   // We use RW.poly's lazy resolution — SubWorkflow's RW is defined after stepRW but
   // registered as part of the poly which resolves lazily at first use (after init).
   override implicit lazy val stepRW: RW[Step] = RW.poly()(
-    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[LoopItemFailJob], RW.gen[TimedJob], RW.gen[ConcProbeJob],
+    RW.gen[ReverseTextJob], RW.gen[FailingJob], RW.gen[LoopItemFailJob], RW.gen[TimedJob], RW.gen[ConcProbeJob], RW.gen[DiskProbeJob],
     RW.gen[RetryableJob], RW.gen[ContinueOnErrorJob], RW.gen[ExponentialBackoffJob], RW.gen[TimeoutJob],
     RW.gen[ThrowInHandleErrorJob], RW.gen[StreamErrorButSucceedsJob], RW.gen[NestedStreamErrorJob],
     RW.gen[TestTrigger], RW.gen[TestCondition], RW.gen[TestApproval], RW.gen[BranchTrigger],
@@ -1238,6 +1308,18 @@ object WorkflowManager extends AbstractWorkflowManager[WorkflowParent, WorkflowM
   override protected def onStepCompleted(workflow: Workflow, stepId: Id[Step], success: Boolean): Task[Unit] = Task {
     hookEvents = s"step:${stepId.value}:$success" :: hookEvents
   }
+}
+
+object ResourceManager extends AbstractWorkflowManager[WorkflowParent, WorkflowModel.type](
+  db.workflowsResource, maxConcurrentWorkflows = 3, resourceLimits = Map("disk" -> 1)
+) {
+  override protected def resolveParent(sourceId: Id[WorkflowParent]): Task[Option[WorkflowParent]] = Task.pure(None)
+}
+
+/** A probe step that uses the limited "disk" resource. */
+case class DiskProbeJob(millis: Long, id: Id[Step] = Step.id()) extends Job[Json] {
+  override def resources: Set[String] = Set("disk")
+  override def execute(workflow: Workflow, pm: ProgressManager): Task[Json] = ConcProbeJob(millis, id).execute(workflow, pm)
 }
 
 object ConcurrentManager extends AbstractWorkflowManager[WorkflowParent, WorkflowModel.type](db.workflowsConcurrent, maxConcurrentWorkflows = 2) {

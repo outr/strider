@@ -27,6 +27,7 @@ Define workflows as a list of typed steps — jobs, triggers, conditions, approv
 - **Bulk operations** — `cancelAll` by name/tag
 - **Configurable concurrency** — `maxConcurrentWorkflows` controls parallel execution
 - **One run per workflow name** — a workflow due while another of the same name is running fails by default (`ConcurrencyMode.Fail`); choose `CancelAndRestart` to replace the running one or `AllowConcurrent` to run both, per workflow at `schedule` or for the whole manager with `defaultConcurrency`
+- **Resource limits** — a step declares the resources it uses heavily (`override def resources = Set("disk")`) and the manager's `resourceLimits` caps how many steps hold each at once across all workflows; a step waits for its permits, and a workflow whose first step would only wait is not started
 - **Crash recovery** — running and waiting workflows are safely marked failed on restart
 - **REST services** — optional status/list/resume/cancel endpoints built on [spice](https://github.com/outr/spice)
 
