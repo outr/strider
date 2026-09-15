@@ -26,6 +26,7 @@ Define workflows as a list of typed steps — jobs, triggers, conditions, approv
 - **Deduplication** — prevent duplicate scheduling with `scheduleIfNotActive`
 - **Bulk operations** — `cancelAll` by name/tag
 - **Configurable concurrency** — `maxConcurrentWorkflows` controls parallel execution
+- **One run per workflow name** — a workflow due while another of the same name is running fails by default (`ConcurrencyMode.Fail`); choose `CancelAndRestart` to replace the running one or `AllowConcurrent` to run both, per workflow at `schedule` or for the whole manager with `defaultConcurrency`
 - **Crash recovery** — running and waiting workflows are safely marked failed on restart
 - **REST services** — optional status/list/resume/cancel endpoints built on [spice](https://github.com/outr/spice)
 

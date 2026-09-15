@@ -17,13 +17,17 @@ import spice.UserException
 import rapid.{Fiber, FiberOps, Task, logger, RapidApp}
 
 import java.util.concurrent.ConcurrentHashMap
+import scala.annotation.tailrec
+import scala.jdk.CollectionConverters.*
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.concurrent.duration.{DurationInt, DurationLong, FiniteDuration}
 import scala.math.Ordered.orderingToOrdered
 
 abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <: AbstractWorkflowModel](
     val collection: Collection[Workflow, WorkflowModel],
-    maxConcurrentWorkflows: Int = 1
+    maxConcurrentWorkflows: Int = 1,
+    /** How a workflow that states no [[ConcurrencyMode]] of its own treats another of the same name already running. */
+    defaultConcurrency: ConcurrencyMode = ConcurrencyMode.Fail
 ) {
   @volatile private var keepAlive = true
   @volatile private var monitorFiber: Fiber[Unit] = _
@@ -38,6 +42,19 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     * would re-pick a still-executing workflow in that window and run it a second time (duplicating
     * `completed`). Membership here excludes it from re-selection until its fork finishes. */
   private val executing = java.util.concurrent.ConcurrentHashMap.newKeySet[Id[Workflow]]()
+
+  /** The name of each workflow a fork is executing, which is what [[ConcurrencyMode]] collides on. */
+  private val executingNames = new ConcurrentHashMap[Id[Workflow], String]()
+
+  /** A [[Recycle]] copy, keyed to the run it continues. The copy is inserted while that run is still finishing, and
+    * waits for it rather than colliding with it. */
+  private val continuations = new ConcurrentHashMap[Id[Workflow], Id[Workflow]]()
+
+  /** Running workflows already cancelled to make way for a [[ConcurrencyMode.CancelAndRestart]] workflow. */
+  private val cancelling = java.util.concurrent.ConcurrentHashMap.newKeySet[Id[Workflow]]()
+
+  /** How many due workflows one selection looks past a workflow it cannot start yet. */
+  private val CandidateLimit = 100
 
   /** Per-workflow pause signal updated by [[pause]] / [[unpause]] and read
     * by [[StatefulJobContext.checkpoint]] in the running step's hot loop.
@@ -74,6 +91,9 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     _ = keepAlive = true
     _ = activeCount.set(0)
     _ = executing.clear()
+    _ = executingNames.clear()
+    _ = continuations.clear()
+    _ = cancelling.clear()
     _ = collection.trigger += new StoreTrigger[Workflow, WorkflowModel] {
       override def insert(doc: Workflow, transaction: Transaction[Workflow, WorkflowModel]): Task[Unit] = Task(changed @= true)
       override def upsert(doc: Workflow, transaction: Transaction[Workflow, WorkflowModel]): Task[Unit] = Task(changed @= true)
@@ -338,6 +358,56 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     }
   }
 
+  private enum Selection {
+    case Start(workflow: Workflow)
+    case Reject(workflow: Workflow, running: List[Id[Workflow]])
+    case Wait(until: Long, cancel: List[Id[Workflow]])
+  }
+
+  private val selectionLock = new Object
+
+  private case class Picked(next: Either[Long, Workflow],
+                            rejected: Option[Workflow] = None,
+                            cancel: List[Id[Workflow]] = Nil)
+
+  /** The effective [[ConcurrencyMode]] of a workflow. */
+  def concurrencyOf(workflow: Workflow): ConcurrencyMode = workflow.concurrency.getOrElse(defaultConcurrency)
+
+  /** The workflows of the same name a fork is executing now, other than this one. */
+  private def runningInstancesOf(workflow: Workflow): List[Id[Workflow]] =
+    executingNames.asScala.collect { case (id, name) if name == workflow.name && id != workflow._id => id }.toList
+
+  /**
+   * Chooses what the monitor does next from the idle unfinished workflows, in priority then schedule order. A workflow
+   * it cannot start yet (already executing, waiting on the run it continues, or waiting for a run it cancelled to stop)
+   * is passed over so the workflows behind it still start; the first workflow not yet due ends the search, as it always
+   * has.
+   */
+  private def select(candidates: List[Workflow], now: Long): Selection = {
+    @tailrec
+    def next(rest: List[Workflow], passedOver: Boolean, cancel: List[Id[Workflow]]): Selection = rest match {
+      case Nil =>
+        Selection.Wait(now + (if (passedOver) 1_000L else 5_000L), cancel)
+      case workflow :: _ if workflow.scheduled > now =>
+        Selection.Wait(if (passedOver) math.min(workflow.scheduled, now + 1_000L) else workflow.scheduled, cancel)
+      case workflow :: tail if workflow.queue.isEmpty || executing.contains(workflow._id) =>
+        next(tail, passedOver = true, cancel)
+      case workflow :: tail =>
+        val running = runningInstancesOf(workflow)
+        val predecessor = Option(continuations.get(workflow._id))
+        if (running.isEmpty) Selection.Start(workflow)
+        else if (predecessor.exists(running.contains)) next(tail, passedOver = true, cancel)
+        else concurrencyOf(workflow) match {
+          case ConcurrencyMode.AllowConcurrent => Selection.Start(workflow)
+          case ConcurrencyMode.Fail => Selection.Reject(workflow, running)
+          case ConcurrencyMode.CancelAndRestart =>
+            val toCancel = running.filter(cancelling.add)
+            next(tail, passedOver = true, cancel ::: toCancel)
+        }
+    }
+    next(candidates, passedOver = false, Nil)
+  }
+
   private def runNextScheduled(): Task[Long] = {
     // Reset up front (not only on the else path): when the slots are full this must clear too, or
     // `changed` stays true and the monitor tight-loops instead of sleeping, starving the very
@@ -361,27 +431,59 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             Sort.ByField(collection.model.priority).desc,
             Sort.ByField(collection.model.scheduled).asc
           )
-          .limit(1)
-          .firstOption
-          .flatMap {
-            case Some(workflow) if workflow.scheduled > System.currentTimeMillis() =>
-              Task.pure(Left[Long, Workflow](workflow.scheduled))
-            case Some(workflow) if workflow.queue.nonEmpty && !executing.contains(workflow._id) =>
-              // Claim it: mark it in-flight (so the inter-step runningId=None window can't re-select
-              // it) and persist runningId. recurseWorkflow re-pops this same head step, so the claim
-              // neither skips nor double-runs it.
-              executing.add(workflow._id)
-              modify(workflow._id, txn)(w => Task.pure(w.copy(runningId = Some(w.queue.head))))
-                .map(Right[Long, Workflow](_))
-            case Some(_) =>
-              // Queue empty, or already being executed by a fork — back off briefly.
-              Task.pure(Left[Long, Workflow](System.currentTimeMillis() + 1_000L))
-            case None =>
-              Task.pure(Left[Long, Workflow](System.currentTimeMillis() + 5_000L))
+          .limit(CandidateLimit)
+          .stream
+          .toList
+          .flatMap { candidates =>
+            val now = System.currentTimeMillis()
+            // Deciding and claiming happen under one lock: two monitor passes (a manager initialized twice, or a
+            // fork racing the monitor) must neither claim the same workflow nor both find no running instance
+            // of a name and start two.
+            val decision = selectionLock.synchronized {
+              select(candidates, now) match {
+                case start @ Selection.Start(workflow) if executing.add(workflow._id) =>
+                  executingNames.put(workflow._id, workflow.name)
+                  continuations.remove(workflow._id)
+                  start
+                case reject @ Selection.Reject(workflow, _) if executing.add(workflow._id) => reject
+                case Selection.Start(_) | Selection.Reject(_, _) => Selection.Wait(now + 100L, Nil)
+                case wait => wait
+              }
+            }
+            decision match {
+              case Selection.Start(workflow) =>
+                // Claimed: in-flight (so the inter-step runningId=None window can't re-select it), with
+                // runningId persisted. recurseWorkflow re-pops this same head step, so the claim neither
+                // skips nor double-runs it.
+                modify(workflow._id, txn)(w => Task.pure(w.copy(runningId = Some(w.queue.head))))
+                  .map(claimed => Picked(Right(claimed)))
+              case Selection.Reject(workflow, running) =>
+                val reason = s"${workflow.name} is already running (${running.map(_.value).mkString(", ")})"
+                modify(workflow._id, txn) { w =>
+                  Task.pure(w.copy(
+                    runningId = None,
+                    history = WorkflowHistory(WorkflowActivity.Completed(false)) ::
+                      WorkflowHistory(WorkflowActivity.StepFailure(w.queue.head, reason)) :: w.history
+                  ))
+                }.map(rejected => Picked(Left(now), rejected = Some(rejected)))
+                  .guarantee(Task(executing.remove(workflow._id)).unit)
+              case Selection.Wait(until, cancel) =>
+                Task.pure(Picked(Left(until), cancel = cancel))
+            }
           }
       }.flatMap {
-        case Left(nextTime) => Task.pure(nextTime)
-        case Right(workflow) =>
+        case Picked(_, Some(rejected), _) =>
+          scribe.warn(s"Not starting ${rejected.name} (${rejected._id.value}): another ${rejected.name} is already running")
+          changed @= true
+          onWorkflowFailed(rejected).handleError(t => logger.error(s"onWorkflowFailed for rejected ${rejected.name}", t)).map(_ => 0L)
+        case Picked(Left(nextTime), _, toCancel) =>
+          toCancel.foldLeft(Task.unit) { (task, id) =>
+            task.flatMap { _ =>
+              scribe.info(s"Cancelling workflow ${id.value} so a newer run of the same workflow can start")
+              cancel(id).map(_ => ()).handleError(t => logger.error(s"Failed to cancel ${id.value} for a restart", t))
+            }
+          }.map(_ => nextTime)
+        case Picked(Right(workflow), _, _) =>
           scribe.info(s"Executing ${workflow.name}")
           activeCount.incrementAndGet()
           changed @= true
@@ -405,6 +507,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
             }
           }.guarantee(Task {
             executing.remove(workflow._id)
+            executingNames.remove(workflow._id)
+            cancelling.remove(workflow._id)
             activeCount.decrementAndGet()
             scribe.info(s"Finished execute for ${workflow.name}")
           })
@@ -425,7 +529,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
                variableDefs: List[WorkflowVariable] = Nil,
                tags: Set[String] = Set.empty,
                workflowTimeoutMs: Option[Long] = None,
-               conversationId: Option[String] = None): Task[Workflow] = {
+               conversationId: Option[String] = None,
+               concurrency: Option[ConcurrencyMode] = None): Task[Workflow] = {
     val workflow = Workflow(
       name = name,
       steps = steps,
@@ -438,6 +543,7 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
       tags = tags,
       workflowTimeoutMs = workflowTimeoutMs,
       conversationId = conversationId,
+      concurrency = concurrency,
       history = List(
         WorkflowHistory(WorkflowActivity.Scheduled(timeStamp)),
         WorkflowHistory(WorkflowActivity.Created)
@@ -459,7 +565,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
                  variables: Map[String, Json] = Map.empty,
                  variableDefs: List[WorkflowVariable] = Nil,
                  tags: Set[String] = Set.empty,
-                 workflowTimeoutMs: Option[Long] = None): Task[Workflow] = schedule(
+                 workflowTimeoutMs: Option[Long] = None,
+                 concurrency: Option[ConcurrencyMode] = None): Task[Workflow] = schedule(
     name = name,
     steps = steps,
     sourceId = sourceId,
@@ -468,7 +575,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     variables = variables,
     variableDefs = variableDefs,
     tags = tags,
-    workflowTimeoutMs = workflowTimeoutMs
+    workflowTimeoutMs = workflowTimeoutMs,
+    concurrency = concurrency
   )
 
   def byId(workflowId: Id[Workflow]): Task[Option[Workflow]] = collection.transaction(_.get(workflowId))
@@ -1170,11 +1278,14 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
           variables = defaultVars + ("_recycleCount" -> fabric.num(currentCount)),
           priority = workflow.priority,
           parentRunId = workflow.parentRunId,
+          concurrency = workflow.concurrency,
           history = List(
             WorkflowHistory(WorkflowActivity.Scheduled(System.currentTimeMillis())),
             WorkflowHistory(WorkflowActivity.Created)
           )
         )
+        // The copy is due at once while this run is still finishing: it waits for this run rather than colliding.
+        continuations.put(fresh._id, workflow._id)
         collection.transaction(_.insert(fresh)).flatMap { _ =>
           changed @= true
           // Continue the current workflow (Recycle step is done, workflow proceeds to completion)
@@ -1469,5 +1580,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
     activeCount.set(0)
     pauseRefs.clear()
     executing.clear()
+    executingNames.clear()
+    continuations.clear()
+    cancelling.clear()
   }
 }

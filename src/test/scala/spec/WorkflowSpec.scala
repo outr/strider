@@ -1,5 +1,6 @@
 package spec
 
+import strider.ConcurrencyMode
 import strider.{AbstractWorkflowManager, AbstractWorkflowModel, ProgressUpdate, StepResultStatus, Workflow, WorkflowActivity, WorkflowParent, WorkflowProgress, WorkflowStatus, WorkflowVariable, VariableType}
 import strider.step.{Approval, Condition, JoinMode, Job, Loop, Parallel, Recycle, RetryBackoff, Step, SubWorkflow, TimeoutAction, Trigger, TriggerMode}
 import fabric.*
@@ -25,6 +26,17 @@ import java.nio.file.Path
 import scala.concurrent.duration.{DurationLong, FiniteDuration}
 
 class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
+  private def awaitStarted(id: Id[Workflow]): Task[Unit] = ConcurrentManager.byId(id).flatMap {
+    case Some(w) if w.started => Task.unit
+    case _ => Task.sleep(25.millis).flatMap(_ => awaitStarted(id))
+  }
+
+  private def awaitRuns(name: String, count: Int, deadline: Long = System.currentTimeMillis() + 20_000L): Task[List[Workflow]] =
+    db.workflowsConcurrent.transaction(_.stream.filter(_.name == name).toList).flatMap { runs =>
+      if (runs.count(_.finished) >= count || System.currentTimeMillis() > deadline) Task.pure(runs)
+      else Task.sleep(100.millis).flatMap(_ => awaitRuns(name, count, deadline))
+    }
+
   private var workflow1Id: Id[Workflow] = _
   private var workflow2Id: Id[Workflow] = _
   private var workflow3Id: Id[Workflow] = _
@@ -40,6 +52,9 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
     }
     "truncate the collection" in {
       db.workflows.transaction(_.truncate.map(_ => succeed))
+    }
+    "truncate the concurrent manager's collection" in {
+      db.workflowsConcurrent.transaction(_.truncate.map(_ => succeed))
     }
     "initialize manager" in {
       WorkflowProgress.attach {
@@ -75,6 +90,64 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         fin.finished should be(true)
         fin.completed.distinct.length should be(fin.completed.length)
         fin.completed.length should be(steps.length)
+      }
+    }
+    "fail a workflow due while another of the same name is running, by default" in {
+      for {
+        _ <- ConcurrentManager.init()
+        first <- ConcurrentManager.schedule("SOLO", List(TimedJob(1500.millis)), testSourceId)
+        _ <- awaitStarted(first._id)
+        second <- ConcurrentManager.schedule("SOLO", List(TimedJob(100.millis)), testSourceId)
+        secondDone <- ConcurrentManager.waitForFinished(second._id)
+        firstDone <- ConcurrentManager.waitForFinished(first._id)
+      } yield {
+        secondDone.status should be(WorkflowStatus.Failure)
+        secondDone.completed should be(Nil)
+        secondDone.history.map(_.activity).collectFirst { case f: WorkflowActivity.StepFailure => f.errorMessage }
+          .getOrElse("") should include(first._id.value)
+        firstDone.status should be(WorkflowStatus.Success)
+      }
+    }
+    "run a workflow of the same name alongside when it allows concurrent instances" in {
+      ConcProbe.reset()
+      for {
+        _ <- ConcurrentManager.init()
+        a <- ConcurrentManager.schedule("TWIN", List(ConcProbeJob(1500L)), testSourceId, concurrency = Some(ConcurrencyMode.AllowConcurrent))
+        _ <- awaitStarted(a._id)
+        b <- ConcurrentManager.schedule("TWIN", List(ConcProbeJob(1500L)), testSourceId, concurrency = Some(ConcurrencyMode.AllowConcurrent))
+        aDone <- ConcurrentManager.waitForFinished(a._id)
+        bDone <- ConcurrentManager.waitForFinished(b._id)
+      } yield {
+        aDone.status should be(WorkflowStatus.Success)
+        bDone.status should be(WorkflowStatus.Success)
+        ConcProbe.max.get() should be(2)
+      }
+    }
+    "cancel the running workflow and start the new one once it stops, when it cancels and restarts" in {
+      val slow = List.fill(6)(TimedJob(300.millis))
+      for {
+        _ <- ConcurrentManager.init()
+        first <- ConcurrentManager.schedule("RESTART", slow, testSourceId)
+        _ <- awaitStarted(first._id)
+        second <- ConcurrentManager.schedule("RESTART", List(TimedJob(100.millis)), testSourceId, concurrency = Some(ConcurrencyMode.CancelAndRestart))
+        secondDone <- ConcurrentManager.waitForFinished(second._id)
+        firstDone <- ConcurrentManager.waitForFinished(first._id)
+      } yield {
+        firstDone.history.map(_.activity) should contain(WorkflowActivity.Cancelled)
+        firstDone.completed.length should be < slow.length
+        secondDone.status should be(WorkflowStatus.Success)
+        val firstEnded = firstDone.history.collectFirst { case h if h.activity.isInstanceOf[WorkflowActivity.Completed] => h.created }.get
+        val secondStarted = secondDone.history.collectFirst { case h if h.activity == WorkflowActivity.Starting => h.created }.get
+        secondStarted should be >= firstEnded
+      }
+    }
+    "let a recycled copy follow the run it continues rather than collide with it" in {
+      for {
+        _ <- ConcurrentManager.init()
+        w <- ConcurrentManager.schedule("RECYCLED", List(TimedJob(100.millis), Recycle(maxExecutions = 3)), testSourceId)
+        runs <- awaitRuns("RECYCLED", 3)
+      } yield {
+        runs.map(_.status).distinct should be(List(WorkflowStatus.Success))
       }
     }
 //    "hide error logging of failed jobs" in {

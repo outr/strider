@@ -31,6 +31,8 @@ case class Workflow(name: String,
                     space: Option[String] = None,
                     createdBy: Option[String] = None,
                     conversationId: Option[String] = None,
+                    // How this workflow treats another of the same name already running; None takes the manager's default.
+                    concurrency: Option[ConcurrencyMode] = None,
                     created: Timestamp = Timestamp(),
                     modified: Timestamp = Timestamp(),
                     _id: Id[Workflow] = Id()) extends RecordDocument[Workflow] {
