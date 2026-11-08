@@ -1047,11 +1047,12 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
         for {
           _ <- addHistory(wf._id, WorkflowActivity.BranchTaken(condition.id, targetId), txn)
           updated <- modify(wf._id, txn) { w =>
-            // Find the target step's position in the queue or step list and jump to it
+            // The branch taken runs next, once; the branch not taken leaves the queue.
+            val branches = Set(condition.onTrue, condition.onFalse)
             Task.pure(w.copy(
               runningId = None,
               completed = condition.id :: w.completed,
-              queue = targetId :: w.queue
+              queue = targetId :: w.queue.filterNot(branches.contains)
             ))
           }
           result <- recurseWorkflow(updated, txn)

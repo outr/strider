@@ -553,6 +553,29 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         finished.payloads(falseJob.id) should be(str("hcnarb-eslaf"))
       }
     }
+    "run only the branch a condition takes, once, then the steps after it" in {
+      def runsOf(wf: Workflow, id: Id[Step]): Int = wf.history.count(_.activity == WorkflowActivity.StepStarted(id))
+      def check(result: Boolean): Task[Unit] = {
+        val trueJob = ReverseTextJob(Right("true-branch"))
+        val falseJob = ReverseTextJob(Right("false-branch"))
+        val afterJob = ReverseTextJob(Right("after"))
+        val condition = TestCondition(result = result, onTrue = trueJob.id, onFalse = falseJob.id)
+        val (taken, untaken) = if (result) (trueJob, falseJob) else (falseJob, trueJob)
+        for {
+          w <- WorkflowManager.schedule(s"ConditionOnce$result", steps = List(condition, trueJob, falseJob, afterJob), sourceId = testSourceId)
+          finished <- WorkflowManager.waitForFinished(w._id)
+        } yield {
+          finished.status should be(WorkflowStatus.Success)
+          runsOf(finished, taken.id) should be(1)
+          runsOf(finished, untaken.id) should be(0)
+          finished.payloads.contains(untaken.id) should be(false)
+          runsOf(finished, afterJob.id) should be(1)
+          finished.payloads(afterJob.id) should be(str("retfa"))
+          ()
+        }
+      }
+      check(result = true).flatMap(_ => check(result = false)).map(_ => succeed)
+    }
     "enter approval wait and approve" in {
       val approval = TestApproval()
       val afterJob = ReverseTextJob(Right("approved"))

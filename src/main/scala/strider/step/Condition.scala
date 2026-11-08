@@ -5,6 +5,10 @@ import strider.Workflow
 import lightdb.id.Id
 import rapid.Task
 
+/**
+ * Chooses one of two steps. The chosen step runs next, once; the other is taken out of the queue and does not run.
+ * Every other queued step runs in order after it.
+ */
 trait Condition extends Step {
   def onTrue: Id[Step]
   def onFalse: Id[Step]
