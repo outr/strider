@@ -1,7 +1,8 @@
 package spec
 
 import strider.ConcurrencyMode
-import strider.{AbstractWorkflowManager, AbstractWorkflowModel, ProgressUpdate, StepResultStatus, Workflow, WorkflowActivity, WorkflowParent, WorkflowProgress, WorkflowStatus, WorkflowVariable, VariableType}
+import strider.{AbstractWorkflowManager, AbstractWorkflowModel, ConditionBranch, ConditionOutcome, ProgressUpdate, StepFailure, StepResult, StepResultStatus, Workflow, WorkflowActivity, WorkflowParent, WorkflowProgress, WorkflowStatus, WorkflowVariable, VariableType}
+import fabric.io.JsonParser
 import strider.step.{Approval, Condition, JoinMode, Job, Loop, Parallel, Recycle, RetryBackoff, Step, SubWorkflow, TimeoutAction, Trigger, TriggerMode}
 import fabric.*
 import fabric.rw.*
@@ -1064,6 +1065,61 @@ class WorkflowSpec extends AsyncWordSpec with AsyncTaskSpec with Matchers {
         result.output should be(None)
       }
     }
+    "record a typed failure a step's throwable carries, through its causes" in {
+      for {
+        w <- WorkflowManager.schedule("StepResultTypedFail", steps = List(TypedFailingJob("out of stock")), sourceId = testSourceId)
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        val result = finished.stepResults.head
+        result.status should be(StepResultStatus.Failed)
+        result.error should be(Some("wrapped"))
+        result.failure should be(Some(StepFailure("shortage", obj("item" -> str("out of stock")))))
+      }
+    }
+    "record no typed failure for a throwable that carries none" in {
+      for {
+        w <- WorkflowManager.schedule("StepResultUntypedFail", steps = List(FailingJob()), sourceId = testSourceId)
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield finished.stepResults.head.failure should be(None)
+    }
+    "record a condition's decision as its step result" in {
+      val trueJob = ReverseTextJob(Right("yes"))
+      val falseJob = ReverseTextJob(Right("no"))
+      val condition = TestCondition(result = false, onTrue = trueJob.id, onFalse = falseJob.id, testedText = Some("stock > 0"))
+      for {
+        w <- WorkflowManager.schedule("ConditionResult", steps = List(condition, trueJob, falseJob), sourceId = testSourceId)
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        val result = finished.stepResults.find(_.stepId == condition.id).getOrElse(fail("no step result for the condition"))
+        result.status should be(StepResultStatus.Completed)
+        result.condition should be(Some(ConditionOutcome(value = false, branch = ConditionBranch.Else, targetStepId = falseJob.id,
+          tested = Some("stock > 0"))))
+      }
+    }
+    "fail the run at a condition that cannot be evaluated, recording its failure" in {
+      val after = ReverseTextJob(Right("after"))
+      val condition = FailingCondition("bad expression", onTrue = after.id, onFalse = after.id)
+      for {
+        w <- WorkflowManager.schedule("ConditionFails", steps = List(condition, after), sourceId = testSourceId)
+        finished <- WorkflowManager.waitForFinished(w._id)
+      } yield {
+        finished.status should be(WorkflowStatus.Failure)
+        val result = finished.stepResults.find(_.stepId == condition.id).getOrElse(fail("no step result for the condition"))
+        result.status should be(StepResultStatus.Failed)
+        result.error should be(Some("bad expression"))
+        result.failure should be(Some(StepFailure("syntax", str("bad expression"))))
+        result.condition should be(None)
+        finished.payloads.contains(after.id) should be(false)
+      }
+    }
+    "read a stored step result written before failures and conditions were recorded" in {
+      val stored = JsonParser("""{"stepId":"s1","stepName":"Old","status":"Failed","durationMs":3,"error":"boom"}""")
+      val result = stored.as[StepResult]
+      result.error should be(Some("boom"))
+      result.failure should be(None)
+      result.condition should be(None)
+      result.status should be(StepResultStatus.Failed)
+    }
     "verify StepResult on continueOnError records failure then next step succeeds" in {
       val failJob = ContinueOnErrorJob()
       val nextJob = ReverseTextJob(Right("after"))
@@ -1313,6 +1369,7 @@ object WorkflowModel extends AbstractWorkflowModel {
     RW.gen[RetryableJob], RW.gen[ContinueOnErrorJob], RW.gen[ExponentialBackoffJob], RW.gen[TimeoutJob],
     RW.gen[ThrowInHandleErrorJob], RW.gen[StreamErrorButSucceedsJob], RW.gen[NestedStreamErrorJob],
     RW.gen[TestTrigger], RW.gen[TestCondition], RW.gen[TestApproval], RW.gen[BranchTrigger],
+    RW.gen[TypedFailingJob], RW.gen[FailingCondition],
     summon[RW[Parallel]], summon[RW[Loop]], summon[RW[Recycle]], SubWorkflow.rw
   )
 }
@@ -1420,6 +1477,23 @@ case class RetryableJob(failTimes: Int, id: Id[Step] = Step.id()) extends Job[St
   }
 }
 
+class ShortageException(item: String) extends RuntimeException(s"short of $item") with StepFailure.Carrier {
+  override def stepFailure: StepFailure = StepFailure("shortage", obj("item" -> str(item)))
+}
+
+case class TypedFailingJob(item: String, id: Id[Step] = Step.id()) extends Job[Json] {
+  override def execute(workflow: Workflow, pm: ProgressManager): Task[Json] =
+    Task.error(new RuntimeException("wrapped", new ShortageException(item)))
+}
+
+class UnparsableException(text: String) extends RuntimeException(text) with StepFailure.Carrier {
+  override def stepFailure: StepFailure = StepFailure("syntax", str(text))
+}
+
+case class FailingCondition(message: String, onTrue: Id[Step], onFalse: Id[Step], id: Id[Step] = Step.id()) extends Condition {
+  override def evaluate(workflow: Workflow): Task[Boolean] = Task.error(new UnparsableException(message))
+}
+
 case class ContinueOnErrorJob(id: Id[Step] = Step.id()) extends Job[Json] {
   override def continueOnError: Boolean = true
 
@@ -1440,7 +1514,9 @@ case class TestTrigger(timeoutOverride: Option[Long] = None,
 case class TestCondition(result: Boolean,
                          onTrue: Id[Step],
                          onFalse: Id[Step],
+                         testedText: Option[String] = None,
                          id: Id[Step] = Step.id()) extends Condition {
+  override def tested: Option[String] = testedText
   override def evaluate(workflow: Workflow): Task[Boolean] = Task.pure(result)
 }
 

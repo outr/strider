@@ -974,7 +974,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
               unregisterPauseRef()
               val durationMs = System.currentTimeMillis() - startTime
               modify(workflow._id, txn) { workflow =>
-                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
+                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage),
+                  failure = StepFailure.of(throwable))
                 Task.pure(addStepResult(workflow, result).copy(
                   runningId = None,
                   completed = job.id :: workflow.completed,
@@ -989,7 +990,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
               unregisterPauseRef()
               val durationMs = System.currentTimeMillis() - startTime
               modify(workflow._id, txn) { workflow =>
-                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage))
+                val result = StepResult(job.id, job.name, StepResultStatus.Failed, durationMs = durationMs, error = Some(throwable.getMessage),
+                  failure = StepFailure.of(throwable))
                 Task.pure(addStepResult(workflow, result).copy(
                   runningId = None,
                   completed = job.id :: workflow.completed,
@@ -1041,22 +1043,44 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
   private def evaluateCondition(workflow: Workflow,
                                  condition: Condition,
                                  txn: Transaction[Workflow, WorkflowModel]): Task[Workflow] = {
+    val startTime = System.currentTimeMillis()
     addHistory(workflow._id, WorkflowActivity.StepStarted(condition.id), txn).flatMap { wf =>
-      condition.evaluate(wf).flatMap { result =>
-        val targetId = if (result) condition.onTrue else condition.onFalse
-        for {
-          _ <- addHistory(wf._id, WorkflowActivity.BranchTaken(condition.id, targetId), txn)
-          updated <- modify(wf._id, txn) { w =>
-            // The branch taken runs next, once; the branch not taken leaves the queue.
-            val branches = Set(condition.onTrue, condition.onFalse)
-            Task.pure(w.copy(
-              runningId = None,
-              completed = condition.id :: w.completed,
-              queue = targetId :: w.queue.filterNot(branches.contains)
-            ))
+      condition.evaluate(wf).attempt.flatMap {
+        case scala.util.Success(result) =>
+          val targetId = if (result) condition.onTrue else condition.onFalse
+          val outcome = ConditionOutcome(value = result, branch = if (result) ConditionBranch.Then else ConditionBranch.Else,
+            targetStepId = targetId, tested = condition.tested)
+          for {
+            _ <- addHistory(wf._id, WorkflowActivity.BranchTaken(condition.id, targetId), txn)
+            updated <- modify(wf._id, txn) { w =>
+              // The branch taken runs next, once; the branch not taken leaves the queue.
+              val branches = Set(condition.onTrue, condition.onFalse)
+              val stepResult = StepResult(condition.id, condition.name, StepResultStatus.Completed,
+                durationMs = System.currentTimeMillis() - startTime, condition = Some(outcome))
+              Task.pure(addStepResult(w, stepResult).copy(
+                runningId = None,
+                completed = condition.id :: w.completed,
+                queue = targetId :: w.queue.filterNot(branches.contains)
+              ))
+            }
+            result <- recurseWorkflow(updated, txn)
+          } yield result
+        case scala.util.Failure(throwable) =>
+          logger.error(s"Condition ${condition.name} failed", throwable).flatMap { _ =>
+            modify(wf._id, txn) { w =>
+              val stepResult = StepResult(condition.id, condition.name, StepResultStatus.Failed,
+                durationMs = System.currentTimeMillis() - startTime, error = Some(throwable.getMessage),
+                failure = StepFailure.of(throwable))
+              Task.pure(addStepResult(w, stepResult).copy(
+                runningId = None,
+                completed = condition.id :: w.completed,
+                history =
+                  WorkflowHistory(WorkflowActivity.Completed(false)) ::
+                    WorkflowHistory(WorkflowActivity.StepFailure(condition.id, s"${condition.name} failed with ${throwable.getMessage}")) ::
+                    w.history
+              ))
+            }.flatTap(w => onStepCompleted(w, condition.id, success = false))
           }
-          result <- recurseWorkflow(updated, txn)
-        } yield result
       }
     }
   }
@@ -1163,7 +1187,8 @@ abstract class AbstractWorkflowManager[Parent <: WorkflowParent, WorkflowModel <
         case _ if job.continueOnError =>
           logger.error(s"Branch step ${job.name} failed, continuing", throwable).flatMap { _ =>
             modify(wf._id, txn) { w =>
-              val result = StepResult(job.id, job.name, StepResultStatus.Failed, error = Some(throwable.getMessage))
+              val result = StepResult(job.id, job.name, StepResultStatus.Failed, error = Some(throwable.getMessage),
+                  failure = StepFailure.of(throwable))
               Task.pure(addStepResult(w, result).copy(
                 completed = job.id :: w.completed,
                 payloads = w.payloads + (job.id -> Null),

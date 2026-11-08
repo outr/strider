@@ -13,6 +13,9 @@ trait Condition extends Step {
   def onTrue: Id[Step]
   def onFalse: Id[Step]
 
+  /** What the condition tests, in words, recorded with its decision ([[strider.ConditionOutcome.tested]]). */
+  def tested: Option[String] = None
+
   /**
    * Evaluate the condition using workflow state (variables, payloads, history).
    *
