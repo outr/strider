@@ -50,7 +50,7 @@ val spiceVersion = "1.10.3"
 
 val lightdbVersion = "4.45.0"
 
-val rapidVersion = "2.9.9"
+val rapidVersion = "2.9.10"
 
 val scalatestVersion = "3.2.20"
 
